@@ -74,6 +74,22 @@ expect 'MATCH (a:`ns2:g`)-[r:calls]->(b:`ns:f`) RETURN a.id, b.id' 'id|id\n'
 # Comma-separated patterns cross-join: two ns:f rows x one ns2:g row.
 expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN a.id, b.id' 'id|id\nf1|g1\nf2|g1\n'
 
+# Aggregation, DISTINCT, ORDER BY, SKIP, LIMIT (M7).
+# count(*) over the two ns:f rows.
+expect 'MATCH (a:`ns:f`) RETURN count(*) AS n' 'n\n2\n'
+# Implicit GROUP BY a.y: one row per distinct y.
+expect 'MATCH (a:`ns:f`) RETURN a.y, count(*) AS n ORDER BY a.y' 'y|n\na|1\nb|1\n'
+# collect -> a JSON array of the ids.
+expect 'MATCH (a:`ns:f`) RETURN collect(a.id) AS ids' 'ids\n["f1","f2"]\n'
+# sum/min/max/avg over a.x (1 and 2).
+expect 'MATCH (a:`ns:f`) RETURN sum(a.x) AS s, min(a.x) AS mn, max(a.x) AS mx, avg(a.x) AS av' 's|mn|mx|av\n3|1|2|1.5\n'
+# ORDER BY ... DESC + LIMIT keeps only the largest.
+expect 'MATCH (a:`ns:f`) RETURN a.x ORDER BY a.x DESC LIMIT 1' 'x\n2\n'
+# SKIP drops the first ordered row.
+expect 'MATCH (a:`ns:f`) RETURN a.x ORDER BY a.x SKIP 1' 'x\n2\n'
+# DISTINCT collapses the cross-join's two g1 rows into one.
+expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN DISTINCT b.id' 'id\ng1\n'
+
 # Errors still propagate on the execution path (unknown column, write clause,
 # unknown column inside WHERE).
 reject 'MATCH (a:`ns:f`) RETURN a.nope'

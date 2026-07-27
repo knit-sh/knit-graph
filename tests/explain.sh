@@ -98,13 +98,42 @@ expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN a.id, b.id' \
 expect 'MATCH (a:`ns:f`)--(b:`ns2:g`) RETURN a.id' \
 	'SELECT a."id" FROM "__provenance__" r JOIN "ns:f" a ON 1 = 1 WHERE (r."source_id" = a."id" AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' OR r."target_id" = a."id" AND r."target_name" = '"'"'ns:f'"'"' AND r."source_name" = '"'"'ns2:g'"'"')'
 
+# Aggregation, DISTINCT, ORDER BY, SKIP, LIMIT (M7).
+# An aggregate implies GROUP BY the non-aggregated RETURN items.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN b.id, count(*) AS n' \
+	'SELECT b."id", count(*) AS "n" FROM "__provenance__" r JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' GROUP BY b."id"'
+# count over a column, ORDER BY the aggregate's alias, LIMIT.
+expect 'MATCH (a:`ns:f`) RETURN a.y, count(a.x) AS n ORDER BY n DESC LIMIT 5' \
+	'SELECT a."y", count(a."x") AS "n" FROM "ns:f" a GROUP BY a."y" ORDER BY "n" DESC LIMIT 5'
+# DISTINCT.
+expect 'MATCH (a:`ns:f`) RETURN DISTINCT a.y' \
+	'SELECT DISTINCT a."y" FROM "ns:f" a'
+# collect -> json_group_array; a sole aggregate needs no GROUP BY.
+expect 'MATCH (a:`ns:f`) RETURN collect(a.id) AS ids' \
+	'SELECT json_group_array(a."id") AS "ids" FROM "ns:f" a'
+# count(DISTINCT ...).
+expect 'MATCH (a:`ns:f`) RETURN count(DISTINCT a.y) AS n' \
+	'SELECT count(DISTINCT a."y") AS "n" FROM "ns:f" a'
+# ORDER BY a property, SKIP + LIMIT -> LIMIT ... OFFSET.
+expect 'MATCH (a:`ns:f`) RETURN a.x ORDER BY a.x SKIP 1 LIMIT 2' \
+	'SELECT a."x" FROM "ns:f" a ORDER BY a."x" LIMIT 2 OFFSET 1'
+# SKIP without LIMIT -> LIMIT -1 OFFSET.
+expect 'MATCH (a:`ns:f`) RETURN a.x SKIP 1' \
+	'SELECT a."x" FROM "ns:f" a LIMIT -1 OFFSET 1'
+
+# M7 errors.
+reject 'MATCH (a:`ns:f`) RETURN foo(a.x)'          # unknown aggregate
+reject 'MATCH (a:`ns:f`) RETURN sum(a.x, a.y)'     # aggregate arity
+reject 'MATCH (a:`ns:f`) RETURN a.x LIMIT a.x'     # non-integer LIMIT
+reject 'MATCH (a:`ns:f`) RETURN a.x ORDER BY zzz'  # ORDER BY unknown name
+
 # Undirected is only supported as a single, sole hop for now.
 reject 'MATCH (a:`ns:f`)-[:calls]->(b:`ns2:g`)-[:wraps]-(c:`ns:f`) RETURN a.id'  # undirected in a chain
 
 # WHERE resolution/scope errors.
 reject 'MATCH (a:`ns:f`) WHERE a.nope = 1 RETURN a.id'         # unknown column
 reject 'MATCH (a:`ns:f`) WHERE a.y STARTS WITH a.x RETURN a.y' # needs a literal
-reject 'MATCH (a:`ns:f`) WHERE count(a.x) > 1 RETURN a.x'      # func (M7)
+reject 'MATCH (a:`ns:f`) WHERE count(a.x) > 1 RETURN a.x'      # aggregate not valid in WHERE
 
 # Resolution errors.
 reject 'MATCH (a:`ns:f`) RETURN a.nope'      # unknown column

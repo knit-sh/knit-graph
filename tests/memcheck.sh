@@ -80,6 +80,19 @@ if make_fixture "$db"; then
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls]->(b)-[:wraps]-(c) RETURN a.id"
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls]->(a:\`ns2:g\`) RETURN a.id"
 
+	# Aggregation/DISTINCT/ORDER BY/SKIP/LIMIT (M7): grouped aggregate, collect,
+	# DISTINCT, ordered+paged, and error paths (bad function, bad arity,
+	# non-integer LIMIT, unknown ORDER BY name).
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN b.id, count(*) AS n"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.y, count(a.x) AS n ORDER BY n DESC LIMIT 5"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN collect(a.id) AS ids"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`), (b:\`ns2:g\`) RETURN DISTINCT b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.x ORDER BY a.x SKIP 1 LIMIT 2"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN foo(a.x)"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN sum(a.x, a.y)"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.x LIMIT a.x"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.x ORDER BY zzz"
+
 	rm -f "$db"
 fi
 

@@ -36,8 +36,13 @@
  * pattern predicates.  Property references in WHERE resolve exactly like those
  * in RETURN and cause the owning node's table to be joined in.
  *
- * Variable-length relationships, aggregation, DISTINCT, ORDER BY/SKIP/LIMIT and
- * RETURN of a whole entity are rejected here; those arrive in later milestones.
+ * RETURN also carries the M7 projection tail: aggregate functions
+ * (count/sum/avg/min/max, and collect -> json_group_array) with an implicit
+ * GROUP BY on the non-aggregated items, DISTINCT, ORDER BY ... [ASC|DESC],
+ * SKIP (-> OFFSET) and LIMIT.
+ *
+ * Variable-length relationships and RETURN of a whole entity are rejected here;
+ * those arrive in later milestones.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -51,6 +56,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* Set *errmsg (if requested) to a formatted, malloc'd message; return 1. */
 static int fail(char **errmsg, const char *fmt, ...)
@@ -179,22 +185,106 @@ static int emit_property(SqlBuf *b, const char *var, const char *key,
 	return 0;
 }
 
-/* Reject the RETURN constructs a later milestone will add. */
+static int emit_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
+                    Bind *binds, int nb, Slot *slots, char **errmsg);
+
+/*
+ * Map a Cypher aggregate name (case-insensitively) to its SQL spelling, or
+ * NULL if it is not one of the aggregates knit-graph supports. `collect`
+ * becomes SQLite's json_group_array; the rest keep their name.
+ */
+static const char *agg_sql_name(const char *fn)
+{
+	if (strcasecmp(fn, "count") == 0)   return "count";
+	if (strcasecmp(fn, "sum") == 0)     return "sum";
+	if (strcasecmp(fn, "avg") == 0)     return "avg";
+	if (strcasecmp(fn, "min") == 0)     return "min";
+	if (strcasecmp(fn, "max") == 0)     return "max";
+	if (strcasecmp(fn, "collect") == 0) return "json_group_array";
+	return NULL;
+}
+
+/* Emit an aggregate call: count(*), count([DISTINCT] x), sum/avg/min/max(x),
+ * collect(x) -> json_group_array(x). The lone argument may be any value
+ * expression (in practice a property, which pulls in its node's join). */
+static int emit_agg(SqlBuf *b, const Expr *e, const Catalog *cat,
+                   Bind *binds, int nb, Slot *slots, char **errmsg)
+{
+	const char *fn = agg_sql_name(e->func);
+	if (!fn)
+		return fail(errmsg, "unsupported function in RETURN: %s()",
+			e->func);
+
+	if (e->func_star) {
+		if (strcasecmp(e->func, "count") != 0)
+			return fail(errmsg,
+				"only count(*) takes '*'; %s() requires an argument",
+				e->func);
+		sqlbuf_append(b, "count(*)");
+		return 0;
+	}
+	if (!e->args || e->args->next)
+		return fail(errmsg, "%s() takes exactly one argument", e->func);
+
+	sqlbuf_append(b, fn);
+	sqlbuf_append_char(b, '(');
+	if (e->func_distinct)
+		sqlbuf_append(b, "DISTINCT ");
+	if (emit_expr(b, e->args->expr, cat, binds, nb, slots, errmsg))
+		return 1;
+	sqlbuf_append_char(b, ')');
+	return 0;
+}
+
+/* A RETURN item is an aggregate when its expression is an aggregate call. */
+static int item_is_aggregate(const ReturnItem *it)
+{
+	return it->expr->kind == EXPR_FUNC && agg_sql_name(it->expr->func);
+}
+
+/* Emit one RETURN/GROUP BY expression: a property or an aggregate call. */
+static int emit_return_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
+                           Bind *binds, int nb, Slot *slots, char **errmsg)
+{
+	if (e->kind == EXPR_PROPERTY)
+		return emit_property(b, e->var, e->key, cat, binds, nb, slots,
+			errmsg);
+	if (e->kind == EXPR_FUNC)
+		return emit_agg(b, e, cat, binds, nb, slots, errmsg);
+	return fail(errmsg,
+		"only property references (e.g. a.x) and aggregate functions "
+		"are supported in RETURN yet");
+}
+
+/* Does the RETURN list define `alias` (for an ORDER BY reference to it)? */
+static int return_has_alias(const Return *r, const char *alias)
+{
+	for (ReturnItem *it = r->items; it; it = it->next)
+		if (it->alias && strcmp(it->alias, alias) == 0)
+			return 1;
+	return 0;
+}
+
+/* Reject the RETURN constructs a later milestone will add, and validate the
+ * projection tail's shape (SKIP/LIMIT must be integer literals). */
 static int check_return_shape(const Return *r, char **errmsg)
 {
 	if (r->star)
 		return fail(errmsg, "RETURN * is not supported yet");
-	if (r->distinct)
-		return fail(errmsg, "RETURN DISTINCT is not supported yet");
-	if (r->order || r->skip || r->limit)
-		return fail(errmsg, "ORDER BY/SKIP/LIMIT are not supported yet");
 
 	for (ReturnItem *it = r->items; it; it = it->next) {
-		if (it->expr->kind != EXPR_PROPERTY)
+		if (it->expr->kind != EXPR_PROPERTY
+				&& it->expr->kind != EXPR_FUNC)
 			return fail(errmsg,
-				"only property references (e.g. a.x) are supported "
-				"in RETURN yet");
+				"only property references (e.g. a.x) and aggregate "
+				"functions are supported in RETURN yet");
 	}
+	if (r->skip && !(r->skip->kind == EXPR_LITERAL
+			&& r->skip->lit_kind == LIT_INT))
+		return fail(errmsg, "SKIP requires an integer literal");
+	if (r->limit && !(r->limit->kind == EXPR_LITERAL
+			&& r->limit->lit_kind == LIT_INT))
+		return fail(errmsg, "LIMIT requires an integer literal");
 	return 0;
 }
 
@@ -216,14 +306,16 @@ static int emit_select(SqlBuf *sql, const Return *r, const Catalog *cat,
                       Bind *binds, int nb, Slot *slots, char **errmsg)
 {
 	sqlbuf_append(sql, "SELECT ");
+	if (r->distinct)
+		sqlbuf_append(sql, "DISTINCT ");
 	int first = 1;
 	for (ReturnItem *it = r->items; it; it = it->next) {
 		if (!first)
 			sqlbuf_append(sql, ", ");
 		first = 0;
 
-		if (emit_property(sql, it->expr->var, it->expr->key, cat,
-				binds, nb, slots, errmsg))
+		if (emit_return_expr(sql, it->expr, cat, binds, nb, slots,
+				errmsg))
 			return 1;
 
 		if (it->alias) {
@@ -232,6 +324,86 @@ static int emit_select(SqlBuf *sql, const Return *r, const Catalog *cat,
 		}
 	}
 	return 0;
+}
+
+/*
+ * Implicit GROUP BY: if any RETURN item aggregates, group by every
+ * non-aggregated item. Emits nothing (leaving grp empty) when there is no
+ * aggregate, or when every item aggregates (a single group over all rows).
+ */
+static int emit_group_by(SqlBuf *grp, const Return *r, const Catalog *cat,
+                        Bind *binds, int nb, Slot *slots, char **errmsg)
+{
+	int has_agg = 0;
+	for (ReturnItem *it = r->items; it; it = it->next)
+		if (item_is_aggregate(it))
+			has_agg = 1;
+	if (!has_agg)
+		return 0;
+
+	int first = 1;
+	for (ReturnItem *it = r->items; it; it = it->next) {
+		if (item_is_aggregate(it))
+			continue;
+		sqlbuf_append(grp, first ? " GROUP BY " : ", ");
+		first = 0;
+		if (emit_return_expr(grp, it->expr, cat, binds, nb, slots,
+				errmsg))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * ORDER BY: each item is either a bare RETURN alias (emitted as a quoted
+ * identifier SQLite resolves to the output column) or a property reference
+ * (which pulls in its node's join, exactly as in SELECT/WHERE).
+ */
+static int emit_order_by(SqlBuf *ord, const Return *r, const Catalog *cat,
+                        Bind *binds, int nb, Slot *slots, char **errmsg)
+{
+	if (!r->order)
+		return 0;
+
+	int first = 1;
+	for (SortItem *si = r->order; si; si = si->next) {
+		sqlbuf_append(ord, first ? " ORDER BY " : ", ");
+		first = 0;
+		if (si->expr->kind == EXPR_VARIABLE) {
+			if (!return_has_alias(r, si->expr->var))
+				return fail(errmsg,
+					"ORDER BY refers to unknown name: %s",
+					si->expr->var);
+			append_ident(ord, si->expr->var);
+		} else if (si->expr->kind == EXPR_PROPERTY) {
+			if (emit_property(ord, si->expr->var, si->expr->key, cat,
+					binds, nb, slots, errmsg))
+				return 1;
+		} else {
+			return fail(errmsg, "ORDER BY supports property "
+				"references and RETURN aliases only");
+		}
+		if (si->desc)
+			sqlbuf_append(ord, " DESC");
+	}
+	return 0;
+}
+
+/* SKIP/LIMIT -> LIMIT/OFFSET. SKIP without LIMIT uses LIMIT -1 (unbounded). */
+static void emit_limit_offset(SqlBuf *out, const Return *r)
+{
+	if (!r->skip && !r->limit)
+		return;
+	if (r->limit) {
+		sqlbuf_append(out, " LIMIT ");
+		sqlbuf_append(out, r->limit->lit_text);
+	} else {
+		sqlbuf_append(out, " LIMIT -1");
+	}
+	if (r->skip) {
+		sqlbuf_append(out, " OFFSET ");
+		sqlbuf_append(out, r->skip->lit_text);
+	}
 }
 
 /* --------------------------------------------------------------- WHERE --- */
@@ -291,9 +463,6 @@ static void append_like_pattern(SqlBuf *b, const char *pre, const char *s,
 	sqlbuf_append(b, post);
 	sqlbuf_append_char(b, '\'');
 }
-
-static int emit_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
-                    Bind *binds, int nb, Slot *slots, char **errmsg);
 
 /* left STARTS WITH/ENDS WITH/CONTAINS 'lit' -> left LIKE 'pattern' ESCAPE '\'. */
 static int emit_like(SqlBuf *b, const Expr *e, const char *pre, const char *post,
@@ -493,11 +662,13 @@ static int transform_general(const Match *m, const Return *r,
 	}
 	int nslots = 0, nedges = 0, nb = 0, nowned = 0, rc = 1;
 
-	SqlBuf sel, uw, from, pred, out;
+	SqlBuf sel, uw, from, pred, grp, ord, out;
 	sqlbuf_init(&sel);
 	sqlbuf_init(&uw);
 	sqlbuf_init(&from);
 	sqlbuf_init(&pred);
+	sqlbuf_init(&grp);
+	sqlbuf_init(&ord);
 	sqlbuf_init(&out);
 
 	/* Collect slots and edges, and anchor each slot to its first edge. */
@@ -595,6 +766,10 @@ static int transform_general(const Match *m, const Return *r,
 	if (emit_select(&sel, r, cat, binds, nb, slots, errmsg))
 		goto done;
 	if (m->where && emit_expr(&uw, m->where, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (emit_order_by(&ord, r, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (emit_group_by(&grp, r, cat, binds, nb, slots, errmsg))
 		goto done;
 
 	/* FROM: the first edge (or, edgeless, the first lone node) is the base;
@@ -697,6 +872,11 @@ static int transform_general(const Match *m, const Return *r,
 		if (have_user)
 			sqlbuf_append(&out, uw.data);
 	}
+	if (grp.len > 0)
+		sqlbuf_append(&out, grp.data);
+	if (ord.len > 0)
+		sqlbuf_append(&out, ord.data);
+	emit_limit_offset(&out, r);
 
 	*sql = sqlbuf_detach(&out);
 	rc = 0;
@@ -706,6 +886,8 @@ done:
 	sqlbuf_free(&uw);
 	sqlbuf_free(&from);
 	sqlbuf_free(&pred);
+	sqlbuf_free(&grp);
+	sqlbuf_free(&ord);
 	sqlbuf_free(&out);
 	for (int i = 0; i < nowned; i++)
 		free(owned[i]);
@@ -798,18 +980,24 @@ static int transform_undirected(const NodePat *left, const RelPat *rel,
 	if (rel->var)
 		binds[nb++] = (Bind){ rel->var, KG_EDGE_TABLE, 0, -1 };
 
-	SqlBuf sel, uw, pred, o1, o2, out;
+	SqlBuf sel, uw, pred, o1, o2, grp, ord, out;
 	sqlbuf_init(&sel);
 	sqlbuf_init(&uw);
 	sqlbuf_init(&pred);
 	sqlbuf_init(&o1);
 	sqlbuf_init(&o2);
+	sqlbuf_init(&grp);
+	sqlbuf_init(&ord);
 	sqlbuf_init(&out);
 	int rc = 1;
 
 	if (emit_select(&sel, r, cat, binds, nb, slots, errmsg))
 		goto done;
 	if (where && emit_expr(&uw, where, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (emit_order_by(&ord, r, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (emit_group_by(&grp, r, cat, binds, nb, slots, errmsg))
 		goto done;
 
 	/* A referenced endpoint needs a label to know which table to join. */
@@ -869,6 +1057,11 @@ static int transform_undirected(const NodePat *left, const RelPat *rel,
 		if (have_user)
 			sqlbuf_append(&out, uw.data);
 	}
+	if (grp.len > 0)
+		sqlbuf_append(&out, grp.data);
+	if (ord.len > 0)
+		sqlbuf_append(&out, ord.data);
+	emit_limit_offset(&out, r);
 
 	*sql = sqlbuf_detach(&out);
 	rc = 0;
@@ -879,6 +1072,8 @@ done:
 	sqlbuf_free(&pred);
 	sqlbuf_free(&o1);
 	sqlbuf_free(&o2);
+	sqlbuf_free(&grp);
+	sqlbuf_free(&ord);
 	sqlbuf_free(&out);
 	return rc;
 }
