@@ -217,7 +217,7 @@ Query *ast_query(Match *matches, Return *ret)
 
 /* --------------------------------------------------------------- free --- */
 
-static void free_strlist(StrList *l)
+void ast_free_strlist(StrList *l)
 {
 	while (l) {
 		StrList *n = l->next;
@@ -227,36 +227,34 @@ static void free_strlist(StrList *l)
 	}
 }
 
-static void free_expr(Expr *e);
-
-static void free_exprlist(ExprList *l)
+void ast_free_exprlist(ExprList *l)
 {
 	while (l) {
 		ExprList *n = l->next;
-		free_expr(l->expr);
+		ast_free_expr(l->expr);
 		free(l);
 		l = n;
 	}
 }
 
-static void free_proplist(PropList *l)
+void ast_free_proplist(PropList *l)
 {
 	while (l) {
 		PropList *n = l->next;
 		free(l->key);
-		free_expr(l->value);
+		ast_free_expr(l->value);
 		free(l);
 		l = n;
 	}
 }
 
-static void free_expr(Expr *e)
+void ast_free_expr(Expr *e)
 {
 	if (!e)
 		return;
-	free_expr(e->left);
-	free_expr(e->right);
-	free_exprlist(e->args);
+	ast_free_expr(e->left);
+	ast_free_expr(e->right);
+	ast_free_exprlist(e->args);
 	free(e->var);
 	free(e->key);
 	free(e->func);
@@ -264,83 +262,105 @@ static void free_expr(Expr *e)
 	free(e);
 }
 
-static void free_node(NodePat *n)
+void ast_free_node(NodePat *n)
 {
 	if (!n)
 		return;
 	free(n->var);
-	free_strlist(n->labels);
-	free_proplist(n->props);
+	ast_free_strlist(n->labels);
+	ast_free_proplist(n->props);
 	free(n);
 }
 
-static void free_rel(RelPat *r)
+void ast_free_rel(RelPat *r)
 {
 	if (!r)
 		return;
 	free(r->var);
-	free_strlist(r->types);
-	free_proplist(r->props);
+	ast_free_strlist(r->types);
+	ast_free_proplist(r->props);
 	free(r);
 }
 
-static void free_path(Path *p)
+void ast_free_segment(Segment *s)
 {
-	if (!p)
-		return;
-	free_node(p->start);
-	Segment *s = p->segments;
 	while (s) {
 		Segment *n = s->next;
-		free_rel(s->rel);
-		free_node(s->node);
+		ast_free_rel(s->rel);
+		ast_free_node(s->node);
 		free(s);
 		s = n;
 	}
+}
+
+void ast_free_path(Path *p)
+{
+	if (!p)
+		return;
+	ast_free_node(p->start);
+	ast_free_segment(p->segments);
 	free(p);
+}
+
+void ast_free_pathlist(PathList *l)
+{
+	while (l) {
+		PathList *n = l->next;
+		ast_free_path(l->path);
+		free(l);
+		l = n;
+	}
+}
+
+void ast_free_match(Match *m)
+{
+	while (m) {
+		Match *n = m->next;
+		ast_free_pathlist(m->patterns);
+		ast_free_expr(m->where);
+		free(m);
+		m = n;
+	}
+}
+
+void ast_free_return_item(ReturnItem *r)
+{
+	while (r) {
+		ReturnItem *n = r->next;
+		ast_free_expr(r->expr);
+		free(r->alias);
+		free(r);
+		r = n;
+	}
+}
+
+void ast_free_sort_item(SortItem *s)
+{
+	while (s) {
+		SortItem *n = s->next;
+		ast_free_expr(s->expr);
+		free(s);
+		s = n;
+	}
+}
+
+void ast_free_return(Return *r)
+{
+	if (!r)
+		return;
+	ast_free_return_item(r->items);
+	ast_free_sort_item(r->order);
+	ast_free_expr(r->skip);
+	ast_free_expr(r->limit);
+	free(r);
 }
 
 void ast_free_query(Query *q)
 {
 	if (!q)
 		return;
-
-	Match *m = q->matches;
-	while (m) {
-		Match *mn = m->next;
-		PathList *pl = m->patterns;
-		while (pl) {
-			PathList *pn = pl->next;
-			free_path(pl->path);
-			free(pl);
-			pl = pn;
-		}
-		free_expr(m->where);
-		free(m);
-		m = mn;
-	}
-
-	if (q->ret) {
-		ReturnItem *ri = q->ret->items;
-		while (ri) {
-			ReturnItem *rn = ri->next;
-			free_expr(ri->expr);
-			free(ri->alias);
-			free(ri);
-			ri = rn;
-		}
-		SortItem *si = q->ret->order;
-		while (si) {
-			SortItem *sn = si->next;
-			free_expr(si->expr);
-			free(si);
-			si = sn;
-		}
-		free_expr(q->ret->skip);
-		free_expr(q->ret->limit);
-		free(q->ret);
-	}
-
+	ast_free_match(q->matches);
+	ast_free_return(q->ret);
 	free(q);
 }
 

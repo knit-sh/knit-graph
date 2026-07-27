@@ -1,0 +1,2 @@
+../build-aux/test-driver: line 112: ./ast_golden.sh: Permission denied
+FAIL ast_golden.sh (exit status: 126)

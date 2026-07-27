@@ -1,0 +1,19 @@
+query
+  match
+    path
+      node a
+        label Foo
+      rel (anon) dir -- varlen *1..3
+        type calls
+      node b
+    where
+      AND
+        CMP >
+          property a.x
+          int 1
+        STARTS WITH
+          property b.name
+          string 'abc'
+  return DISTINCT
+    item
+      variable a

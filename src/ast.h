@@ -184,8 +184,29 @@ Return     *ast_return(int distinct, int star, ReturnItem *items,
                        SortItem *order, Expr *skip, Expr *limit);
 Query      *ast_query(Match *matches, Return *ret);
 
-/* --------------------------------------------------------------- misc --- */
+/* ---------------------------------------------------------------- free --- */
 
+/*
+ * Granular destructors, one per AST type. Each frees the node it is given and
+ * everything reachable from it, including the rest of the linked list where the
+ * type is chained (StrList, ExprList, PropList, Segment, PathList, Match,
+ * ReturnItem, SortItem). All accept NULL. These are used both by
+ * ast_free_query and by the parser's %destructor rules, so a partially built
+ * tree is released cleanly when a parse fails.
+ */
+void ast_free_expr(Expr *e);
+void ast_free_exprlist(ExprList *l);
+void ast_free_strlist(StrList *l);
+void ast_free_proplist(PropList *l);
+void ast_free_node(NodePat *n);
+void ast_free_rel(RelPat *r);
+void ast_free_segment(Segment *s);
+void ast_free_path(Path *p);
+void ast_free_pathlist(PathList *l);
+void ast_free_match(Match *m);
+void ast_free_return_item(ReturnItem *r);
+void ast_free_sort_item(SortItem *s);
+void ast_free_return(Return *r);
 void ast_free_query(Query *q);
 
 /* Pretty-print the AST as an indented tree (used by --ast and tests). */

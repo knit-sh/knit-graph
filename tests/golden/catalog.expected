@@ -1,0 +1,16 @@
+table __provenance__
+  column source_id
+  column source_name
+  column target_id
+  column target_name
+  column edge_type
+  column start_time
+  column end_time
+  column alias
+table ns2:g
+  column id
+  column z
+table ns:f
+  column id
+  column x
+  column y

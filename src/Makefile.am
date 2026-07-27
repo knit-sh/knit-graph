@@ -5,6 +5,7 @@ bin_PROGRAMS = knit-graph
 knit_graph_SOURCES = \
 	main.c \
 	ast.c ast.h \
+	catalog.c catalog.h \
 	cypher_parser.y \
 	cypher_scanner.l
 

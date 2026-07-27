@@ -1,0 +1,1 @@
+MATCH (a:Foo) RETURN a

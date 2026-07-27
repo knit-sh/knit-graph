@@ -80,6 +80,28 @@
 %right NOT
 %nonassoc '=' NE '<' '>' LE GE STARTS ENDS CONTAINS IN IS
 
+/*
+ * When a parse fails, Bison discards the semantic values still on its stack.
+ * Without these destructors those partially built fragments (and the strings
+ * the scanner malloc'd) would leak. Each reduction transfers ownership upward
+ * (e.g. list tails are linked into their head), so only the live stack symbols
+ * are destroyed, each exactly once.
+ */
+%destructor { free($$); }                <str>
+%destructor { ast_free_expr($$); }       <expr>
+%destructor { ast_free_exprlist($$); }   <exprlist>
+%destructor { ast_free_strlist($$); }    <strlist>
+%destructor { ast_free_proplist($$); }   <proplist>
+%destructor { ast_free_node($$); }       <node>
+%destructor { ast_free_rel($$); }        <rel>
+%destructor { ast_free_segment($$); }    <seg>
+%destructor { ast_free_path($$); }       <path>
+%destructor { ast_free_pathlist($$); }   <pathlist>
+%destructor { ast_free_match($$); }      <match>
+%destructor { ast_free_return_item($$); } <ritem>
+%destructor { ast_free_sort_item($$); }  <sort>
+%destructor { ast_free_return($$); }     <ret>
+
 %%
 
 statement

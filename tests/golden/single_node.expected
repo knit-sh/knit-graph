@@ -1,0 +1,8 @@
+query
+  match
+    path
+      node a
+        label Foo
+  return
+    item
+      variable a

@@ -1,0 +1,19 @@
+query
+  match
+    path
+      node a
+        label ns:f
+      rel r dir ->
+        type calls
+      node b
+        label ns2:g
+  return
+    item
+      property b.id
+    item AS n
+      func count *
+    order
+      sort DESC
+        variable n
+    limit
+      int 5
