@@ -32,5 +32,5 @@ AS_IF([test "x$enable_coverage" = "xyes"],
 AC_SUBST([COVERAGE_CFLAGS])
 AC_SUBST([COVERAGE_LDFLAGS])
 
-AC_CONFIG_FILES([Makefile src/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile tests/Makefile])
 AC_OUTPUT

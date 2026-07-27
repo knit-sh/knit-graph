@@ -1,5 +1,5 @@
 ## Top-level automake file.
 
-SUBDIRS = src
+SUBDIRS = src tests
 
 EXTRA_DIST = specifications.md milestones.md CLAUDE.md README.md
