@@ -32,12 +32,18 @@ for ref in "ns:f" "ns2:g" "ns:f.x" "__provenance__.alias"; do
 	fi
 done
 
-# Unknown references must fail.
-for ref in "nope:missing" "ns:f.nope" "__provenance__.bogus"; do
+# Unknown references must fail. "kv"/"counter" exist in the database but have no
+# TEXT "id" key, so the catalog excludes them and they read as unknown tables.
+for ref in "nope:missing" "ns:f.nope" "__provenance__.bogus" "kv" "counter"; do
 	if "$KG" --catalog "$db" "$ref" > /dev/null 2>&1; then
 		echo "FAIL: unknown reference accepted: $ref"; fail=1
 	fi
 done
+
+# The excluded tables must not appear anywhere in the full dump.
+if grep -Eq '(^| )(kv|counter)$' cat_dump.out; then
+	echo "FAIL: a non-graph table leaked into the catalog dump"; fail=1
+fi
 
 rm -f "$db" cat_dump.out
 exit $fail

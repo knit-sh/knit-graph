@@ -48,6 +48,15 @@ if make_fixture "$db"; then
 	run $VG "$KG" --catalog "$db" "ns:f.x"
 	run $VG "$KG" --catalog "$db" "nope"
 	run $VG "$KG" --catalog "$db" "ns:f.nope"
+
+	# --explain: successful translations and rejected/erroring ones, so the
+	# transformer's cleanup is exercised on both paths.
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`) RETURN a.x"
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN r.alias, b.id"
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)<-[r:calls]-(b:\`ns2:g\`) RETURN b.id"
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`) RETURN a.nope"
+	run $VG "$KG" --explain "$db" "MATCH (a) WHERE a.x = 1 RETURN a.x"
+
 	rm -f "$db"
 fi
 

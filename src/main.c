@@ -2,12 +2,13 @@
  * knit-graph -- translate a read-only Cypher statement into SQL and run it
  * against a SQLite provenance database.
  *
- * Current state (M2): the Cypher parser is wired in and a schema catalog can be
+ * Current state (M3): the Cypher parser is wired in and a schema catalog can be
  * read from the database. `--ast` parses a statement and prints its syntax tree
  * (no database needed). `--catalog` introspects a database and lists its tables
- * and columns, or validates a single table / table.column reference. The plain
- * DBFILE + query path still only opens the DB read-only and confirms the query
- * parses; SQL translation and execution arrive in M3/M4.
+ * and columns, or validates a single table / table.column reference.
+ * `--explain` translates a statement into SQL (using the catalog) and prints it
+ * without executing. The plain DBFILE + query path still only opens the DB
+ * read-only and confirms the query parses; execution arrives in M4.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -22,6 +23,7 @@
 
 #include "ast.h"
 #include "catalog.h"
+#include "transform.h"
 
 static const char *PROG = "knit-graph";
 
@@ -30,6 +32,7 @@ static void usage(FILE *out)
 	fprintf(out,
 		"Usage: %s [--ast] DBFILE 'CYPHER'\n"
 		"       %s --ast 'CYPHER'\n"
+		"       %s --explain DBFILE 'CYPHER'\n"
 		"       %s --catalog DBFILE [TABLE[.COLUMN]]\n"
 		"\n"
 		"Translate a read-only Cypher statement into SQL and run it against the\n"
@@ -37,10 +40,11 @@ static void usage(FILE *out)
 		"\n"
 		"Options:\n"
 		"  --ast         parse only and print the syntax tree (no database)\n"
+		"  --explain     translate to SQL and print it, without executing\n"
 		"  --catalog     list the database's tables and columns; with a TABLE or\n"
 		"                TABLE.COLUMN argument, validate that reference\n"
 		"  -h, --help    show this help and exit\n",
-		PROG, PROG, PROG);
+		PROG, PROG, PROG, PROG);
 }
 
 /* Open DBFILE read-only, reporting failure to stderr. Returns NULL on error. */
@@ -146,9 +150,53 @@ static int run_catalog(const char *dbfile, const char *ref)
 	return status;
 }
 
+/*
+ * --explain: parse QUERY, translate it to SQL using DBFILE's schema, and print
+ * the SQL without executing it. Returns a process exit code.
+ */
+static int run_explain(const char *dbfile, const char *query)
+{
+	sqlite3 *db = open_db_ro(dbfile);
+	if (!db)
+		return 1;
+
+	Catalog *cat = NULL;
+	char *err = NULL;
+	if (catalog_load(db, &cat, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot read schema");
+		free(err);
+		sqlite3_close(db);
+		return 1;
+	}
+
+	Query *q = parse_or_report(query);
+	if (!q) {
+		catalog_free(cat);
+		sqlite3_close(db);
+		return 1;
+	}
+
+	char *sql = NULL;
+	int status = 0;
+	if (transform_query(q, cat, &sql, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot translate query");
+		status = 1;
+	} else {
+		printf("%s\n", sql);
+	}
+
+	free(sql);
+	free(err);
+	ast_free_query(q);
+	catalog_free(cat);
+	sqlite3_close(db);
+	return status;
+}
+
 int main(int argc, char **argv)
 {
 	int ast_mode = 0;
+	int explain_mode = 0;
 	int catalog_mode = 0;
 	const char *pos[2] = { NULL, NULL };
 	int npos = 0;
@@ -160,6 +208,8 @@ int main(int argc, char **argv)
 			return 0;
 		} else if (strcmp(argv[i], "--ast") == 0) {
 			ast_mode = 1;
+		} else if (strcmp(argv[i], "--explain") == 0) {
+			explain_mode = 1;
 		} else if (strcmp(argv[i], "--catalog") == 0) {
 			catalog_mode = 1;
 		} else if (npos < 2) {
@@ -171,10 +221,24 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (ast_mode && catalog_mode) {
-		fprintf(stderr, "%s: --ast and --catalog are mutually exclusive\n", PROG);
+	if (ast_mode + explain_mode + catalog_mode > 1) {
+		fprintf(stderr,
+			"%s: --ast, --explain and --catalog are mutually exclusive\n",
+			PROG);
 		usage(stderr);
 		return 2;
+	}
+
+	/* --explain: translate QUERY to SQL against DBFILE and print it. */
+	if (explain_mode) {
+		if (npos != 2) {
+			fprintf(stderr,
+				"%s: --explain expects a database file and a Cypher statement\n",
+				PROG);
+			usage(stderr);
+			return 2;
+		}
+		return run_explain(pos[0], pos[1]);
 	}
 
 	/* --catalog: introspect DBFILE, optionally validating a reference. */

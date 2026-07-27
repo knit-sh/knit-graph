@@ -7,6 +7,11 @@
  * "__provenance__". The transformer (M3+) uses this to expand "RETURN a",
  * resolve labels/properties to columns, and report unknown tables/columns.
  *
+ * Only tables that participate in the graph are catalogued: the edge table,
+ * plus any table with an "id" column typed TEXT (the UUID7 key that ties node
+ * rows to edges). Tables without such a key -- e.g. plain key/value stores --
+ * are skipped, keeping the catalog small and confined to queryable entities.
+ *
  * The catalog owns all of its memory; catalog_free releases it.
  */
 

@@ -6,6 +6,8 @@ knit_graph_SOURCES = \
 	main.c \
 	ast.c ast.h \
 	catalog.c catalog.h \
+	sqlbuf.c sqlbuf.h \
+	transform.c transform.h \
 	cypher_parser.y \
 	cypher_scanner.l
 

@@ -11,6 +11,9 @@ make_fixture() {
 	sqlite3 "$db" <<'SQL'
 CREATE TABLE "ns:f"  (id TEXT, x INTEGER, y TEXT);
 CREATE TABLE "ns2:g" (id TEXT, z REAL);
+-- Non-graph tables: no TEXT "id" key, so the catalog must skip them.
+CREATE TABLE "kv"      (key TEXT, value TEXT);
+CREATE TABLE "counter" (id INTEGER, n INTEGER);
 CREATE TABLE "__provenance__" (
 	source_id   TEXT,
 	source_name TEXT,
