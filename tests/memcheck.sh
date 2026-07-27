@@ -57,6 +57,12 @@ if make_fixture "$db"; then
 	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`) RETURN a.nope"
 	run $VG "$KG" --explain "$db" "MATCH (a) WHERE a.x = 1 RETURN a.x"
 
+	# Full execution path (parse -> transform -> exec -> output): a node query,
+	# a relationship query (with a NULL field), and an erroring translation.
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.x AS ex, a.y"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN r.alias, b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.nope"
+
 	rm -f "$db"
 fi
 

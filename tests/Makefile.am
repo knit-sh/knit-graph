@@ -15,6 +15,7 @@ TESTS = \
 	ast_golden.sh \
 	catalog.sh \
 	explain.sh \
+	exec.sh \
 	memcheck.sh
 
 # Ship the tests and their fixtures in the distribution tarball.
@@ -25,6 +26,7 @@ EXTRA_DIST = \
 	ast_golden.sh \
 	catalog.sh \
 	explain.sh \
+	exec.sh \
 	memcheck.sh \
 	fixture.sh \
 	golden

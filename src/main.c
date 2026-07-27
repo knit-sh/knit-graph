@@ -2,13 +2,13 @@
  * knit-graph -- translate a read-only Cypher statement into SQL and run it
  * against a SQLite provenance database.
  *
- * Current state (M3): the Cypher parser is wired in and a schema catalog can be
- * read from the database. `--ast` parses a statement and prints its syntax tree
- * (no database needed). `--catalog` introspects a database and lists its tables
- * and columns, or validates a single table / table.column reference.
- * `--explain` translates a statement into SQL (using the catalog) and prints it
- * without executing. The plain DBFILE + query path still only opens the DB
- * read-only and confirms the query parses; execution arrives in M4.
+ * Current state (M4): the plain DBFILE + query path runs end to end -- parse,
+ * translate to SQL against the schema catalog, execute, and print the result in
+ * sqlite3's default "-list" format (pipe-separated, with a header row).
+ * `--ast` parses a statement and prints its syntax tree (no database needed).
+ * `--catalog` introspects a database and lists its tables and columns, or
+ * validates a single table / table.column reference. `--explain` translates a
+ * statement into SQL (using the catalog) and prints it without executing.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -23,6 +23,7 @@
 
 #include "ast.h"
 #include "catalog.h"
+#include "exec.h"
 #include "transform.h"
 
 static const char *PROG = "knit-graph";
@@ -193,6 +194,50 @@ static int run_explain(const char *dbfile, const char *query)
 	return status;
 }
 
+/*
+ * Default path: parse QUERY, translate it to SQL against DBFILE's schema,
+ * execute it, and print the result set in "-list" format. Returns an exit code.
+ */
+static int run_query(const char *dbfile, const char *query)
+{
+	sqlite3 *db = open_db_ro(dbfile);
+	if (!db)
+		return 1;
+
+	Catalog *cat = NULL;
+	char *err = NULL;
+	if (catalog_load(db, &cat, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot read schema");
+		free(err);
+		sqlite3_close(db);
+		return 1;
+	}
+
+	Query *q = parse_or_report(query);
+	if (!q) {
+		catalog_free(cat);
+		sqlite3_close(db);
+		return 1;
+	}
+
+	char *sql = NULL;
+	int status = 0;
+	if (transform_query(q, cat, &sql, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot translate query");
+		status = 1;
+	} else if (exec_query(db, sql, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot run query");
+		status = 1;
+	}
+
+	free(sql);
+	free(err);
+	ast_free_query(q);
+	catalog_free(cat);
+	sqlite3_close(db);
+	return status;
+}
+
 int main(int argc, char **argv)
 {
 	int ast_mode = 0;
@@ -272,24 +317,5 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	const char *dbfile = pos[0];
-	const char *query = pos[1];
-
-	sqlite3 *db = open_db_ro(dbfile);
-	if (!db)
-		return 1;
-
-	Query *q = parse_or_report(query);
-	if (!q) {
-		sqlite3_close(db);
-		return 1;
-	}
-
-	/* M2 stub: parsing succeeded. SQL translation/execution land in M3/M4. */
-	printf("knit-graph: opened '%s' read-only\n", dbfile);
-	printf("knit-graph: query parsed successfully\n");
-
-	ast_free_query(q);
-	sqlite3_close(db);
-	return 0;
+	return run_query(pos[0], pos[1]);
 }
