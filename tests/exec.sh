@@ -90,6 +90,19 @@ expect 'MATCH (a:`ns:f`) RETURN a.x ORDER BY a.x SKIP 1' 'x\n2\n'
 # DISTINCT collapses the cross-join's two g1 rows into one.
 expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN DISTINCT b.id' 'id\ng1\n'
 
+# Variable-length paths -> recursive CTE (M8). The fixture's 'chain' edges form
+# a 2-cycle f1 -> f2 -> f1; walks start at f1 (pinned via WHERE) over ns:f.
+# *1..1: only the depth-1 neighbour.
+expect 'MATCH (a:`ns:f`)-[:chain*1..1]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id' 'id\nf2\n'
+# *1..2: f2 at depth 1 and f1 at depth 2 (the cycle closes).
+expect 'MATCH (a:`ns:f`)-[:chain*1..2]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id ORDER BY b.id' 'id\nf1\nf2\n'
+# *2..2: the lower bound drops the depth-1 row, leaving only f1.
+expect 'MATCH (a:`ns:f`)-[:chain*2..2]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id' 'id\nf1\n'
+# Unbounded *: edge-uniqueness terminates the walk on the cycle (f2, then f1).
+expect 'MATCH (a:`ns:f`)-[:chain*]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id ORDER BY b.id' 'id\nf1\nf2\n'
+# A var-length hop composes with aggregation: two nodes reachable within 2 hops.
+expect 'MATCH (a:`ns:f`)-[:chain*1..2]->(b:`ns:f`) WHERE a.id = "f1" RETURN count(*) AS reachable' 'reachable\n2\n'
+
 # Errors still propagate on the execution path (unknown column, write clause,
 # unknown column inside WHERE).
 reject 'MATCH (a:`ns:f`) RETURN a.nope'

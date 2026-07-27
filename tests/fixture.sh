@@ -34,6 +34,13 @@ VALUES
 	-- A second edge of a *different* type, g1 -> f2, so f1 -calls-> g1 -wraps-> f2
 	-- is a two-hop chain. Its distinct edge_type keeps the 'calls'-only queries
 	-- (and the reversed-direction test) unaffected.
-	('g1', 'ns2:g', 'f2', 'ns:f', 'wraps', 0.0, 1.0, NULL);
+	('g1', 'ns2:g', 'f2', 'ns:f', 'wraps', 0.0, 1.0, NULL),
+	-- A 'chain' edge_type forming a 2-cycle within ns:f (f1 -> f2 -> f1), used by
+	-- the variable-length tests (M8). Being its own edge_type over the existing
+	-- node ids, it is invisible to every 'calls'/'wraps' test, and the cycle
+	-- exercises the recursion's edge-uniqueness termination guard on unbounded
+	-- walks. Reachable from f1: f2 at depth 1, f1 at depth 2, then no new edges.
+	('f1', 'ns:f', 'f2', 'ns:f', 'chain', 0.0, 1.0, NULL),
+	('f2', 'ns:f', 'f1', 'ns:f', 'chain', 0.0, 1.0, NULL);
 SQL
 }

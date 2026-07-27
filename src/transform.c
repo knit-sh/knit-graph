@@ -41,8 +41,17 @@
  * GROUP BY on the non-aggregated items, DISTINCT, ORDER BY ... [ASC|DESC],
  * SKIP (-> OFFSET) and LIMIT.
  *
- * Variable-length relationships and RETURN of a whole entity are rejected here;
- * those arrive in later milestones.
+ * A variable-length hop `(a)-[:t*m..n]->(b)` (M8) is compiled to a recursive
+ * CTE that walks __provenance__ from each edge outward, carrying the original
+ * source, the current frontier, a depth, and the set of edges already used.
+ * The edge-uniqueness guard (an edge's rowid may appear once per path) both
+ * matches Cypher's relationship-uniqueness and guarantees termination on a
+ * cyclic graph, so unbounded `*` and `*m..` are safe. The walk exposes the same
+ * source_/target_ column pairs as the edge table, so the endpoint joins, label
+ * predicates and the whole RETURN tail above are reused unchanged. It is
+ * supported as a single directed hop (like the undirected case).
+ *
+ * RETURN of a whole entity is rejected here; that arrives in a later milestone.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -1078,6 +1087,261 @@ done:
 	return rc;
 }
 
+/* ------------------------------------------------- variable-length hop --- */
+
+#define KG_WALK_CTE "walk"
+
+/*
+ * A variable-length hop `(a)-[:t*m..n]->(b)` compiled to a recursive CTE.
+ *
+ * The CTE `walk` carries, per path, the fixed original source
+ * (source_id, source_name), the current frontier (target_id, target_name), the
+ * hop count `depth`, and `path` -- the '/'-delimited list of edge rowids already
+ * traversed. The base member is every type-matching edge (depth 1); the
+ * recursive member extends a path by an edge whose source meets the current
+ * frontier, provided that edge's rowid is not already in `path`. That edge
+ * uniqueness is Cypher's relationship-uniqueness and, since the edge set is
+ * finite, guarantees termination even when `n` is unbounded.
+ *
+ * The outer query then treats `walk` exactly like one edge instance: the
+ * source-side and target-side nodes are joined to their function tables when
+ * referenced and constrained by source_name/target_name when labelled, and
+ * `depth >= m` enforces the lower bound (the upper bound is enforced inside the
+ * recursion). Only a single directed hop is handled; a bound relationship
+ * variable is rejected (its Cypher value is a list, unsupported here).
+ */
+static int transform_varlen(const NodePat *left, const RelPat *rel,
+                           const NodePat *right, const Return *r,
+                           const Expr *where, const Catalog *cat,
+                           char **sql, char **errmsg)
+{
+	if (check_node(left, errmsg) || check_node(right, errmsg))
+		return 1;
+	if (rel->props)
+		return fail(errmsg, "inline property maps are not supported yet");
+	if (rel->types && rel->types->next)
+		return fail(errmsg,
+			"multiple relationship types are not supported yet");
+	if (rel->dir == REL_UNDIR)
+		return fail(errmsg, "undirected variable-length relationships "
+			"are not supported yet");
+	if (rel->var)
+		return fail(errmsg, "a variable cannot be bound to a "
+			"variable-length relationship");
+
+	/* Bounds: Cypher's default lower bound is 1; the upper may be open. */
+	const VarLen *vl = &rel->varlen;
+	int min = vl->has_min ? vl->min : 1;
+	if (min < 1)
+		return fail(errmsg,
+			"variable-length lower bound must be at least 1");
+	if (vl->has_max && vl->max < 1)
+		return fail(errmsg,
+			"variable-length upper bound must be at least 1");
+	if (vl->has_min && vl->has_max && vl->min > vl->max)
+		return fail(errmsg,
+			"variable-length lower bound exceeds upper bound");
+
+	const char *u_label = left->labels ? left->labels->s : NULL;
+	const char *v_label = right->labels ? right->labels->s : NULL;
+	if (u_label && !catalog_find_table(cat, u_label))
+		return fail(errmsg, "unknown table: %s", u_label);
+	if (v_label && !catalog_find_table(cat, v_label))
+		return fail(errmsg, "unknown table: %s", v_label);
+
+	const char *type = rel->types ? rel->types->s : NULL;
+	const char *edge = "r"; /* the walk CTE's alias in the outer query */
+
+	/* Slot 0 = left node, slot 1 = right node. */
+	Slot slots[2];
+	memset(slots, 0, sizeof slots);
+	slots[0].var = left->var;
+	slots[0].label = u_label;
+	slots[0].alias = left->var;
+	slots[0].anchor_edge = -1;
+	slots[1].var = right->var;
+	slots[1].label = v_label;
+	slots[1].alias = right->var;
+	slots[1].anchor_edge = -1;
+
+	Bind binds[2];
+	int nb = 0;
+	if (left->var)
+		binds[nb++] = (Bind){ left->var, u_label, 1, 0 };
+	if (right->var)
+		binds[nb++] = (Bind){ right->var, v_label, 1, 1 };
+
+	SqlBuf sel, uw, pred, grp, ord, out;
+	sqlbuf_init(&sel);
+	sqlbuf_init(&uw);
+	sqlbuf_init(&pred);
+	sqlbuf_init(&grp);
+	sqlbuf_init(&ord);
+	sqlbuf_init(&out);
+	int rc = 1;
+
+	if (emit_select(&sel, r, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (where && emit_expr(&uw, where, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (emit_order_by(&ord, r, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (emit_group_by(&grp, r, cat, binds, nb, slots, errmsg))
+		goto done;
+
+	/* A referenced endpoint needs a label to know which table to join. */
+	for (int i = 0; i < 2; i++) {
+		if (slots[i].referenced && !slots[i].label) {
+			fail(errmsg,
+				"cannot resolve columns of '%s': it has no label",
+				slots[i].var);
+			goto done;
+		}
+	}
+
+	/* Map the pattern's endpoints onto the edge's source/target side: `->`
+	 * puts the left node on the source side, `<-` swaps them. */
+	int src_i = (rel->dir == REL_LEFT) ? 1 : 0;
+	int tgt_i = (rel->dir == REL_LEFT) ? 0 : 1;
+	struct { int slot; const char *idcol; const char *namecol; } ends[2] = {
+		{ src_i, "source_id", "source_name" },
+		{ tgt_i, "target_id", "target_name" },
+	};
+
+	/* WITH RECURSIVE walk(...) AS ( base UNION ALL recursive ). */
+	sqlbuf_append(&out, "WITH RECURSIVE ");
+	append_ident(&out, KG_WALK_CTE);
+	sqlbuf_append(&out, "(source_id, source_name, target_id, target_name, "
+		"depth, path) AS (SELECT ");
+	append_column(&out, "e", "source_id");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "e", "source_name");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "e", "target_id");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "e", "target_name");
+	sqlbuf_append(&out, ", 1, '/' || e.rowid || '/' FROM ");
+	append_ident(&out, KG_EDGE_TABLE);
+	sqlbuf_append(&out, " e");
+	if (type) {
+		sqlbuf_append(&out, " WHERE ");
+		append_column(&out, "e", "edge_type");
+		sqlbuf_append(&out, " = ");
+		append_string(&out, type);
+	}
+	sqlbuf_append(&out, " UNION ALL SELECT ");
+	append_column(&out, "w", "source_id");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "w", "source_name");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "e", "target_id");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "e", "target_name");
+	sqlbuf_append(&out, ", ");
+	append_column(&out, "w", "depth");
+	sqlbuf_append(&out, " + 1, ");
+	append_column(&out, "w", "path");
+	sqlbuf_append(&out, " || e.rowid || '/' FROM ");
+	append_ident(&out, KG_WALK_CTE);
+	sqlbuf_append(&out, " w JOIN ");
+	append_ident(&out, KG_EDGE_TABLE);
+	sqlbuf_append(&out, " e ON ");
+	append_column(&out, "e", "source_id");
+	sqlbuf_append(&out, " = ");
+	append_column(&out, "w", "target_id");
+	sqlbuf_append(&out, " AND ");
+	append_column(&out, "e", "source_name");
+	sqlbuf_append(&out, " = ");
+	append_column(&out, "w", "target_name");
+	sqlbuf_append(&out, " WHERE ");
+	if (type) {
+		append_column(&out, "e", "edge_type");
+		sqlbuf_append(&out, " = ");
+		append_string(&out, type);
+		sqlbuf_append(&out, " AND ");
+	}
+	if (vl->has_max) {
+		char buf[32];
+		append_column(&out, "w", "depth");
+		snprintf(buf, sizeof buf, " < %d AND ", vl->max);
+		sqlbuf_append(&out, buf);
+	}
+	append_column(&out, "w", "path");
+	sqlbuf_append(&out, " NOT LIKE '%/' || e.rowid || '/%') ");
+
+	/* Outer query: the walk stands in for a single edge instance. */
+	sqlbuf_append(&out, sel.data ? sel.data : "");
+	sqlbuf_append(&out, " FROM ");
+	append_ident(&out, KG_WALK_CTE);
+	sqlbuf_append_char(&out, ' ');
+	sqlbuf_append(&out, edge);
+	for (int k = 0; k < 2; k++) {
+		Slot *s = &slots[ends[k].slot];
+		if (!s->referenced)
+			continue;
+		sqlbuf_append(&out, " JOIN ");
+		append_ident(&out, s->label);
+		sqlbuf_append_char(&out, ' ');
+		sqlbuf_append(&out, s->alias);
+		sqlbuf_append(&out, " ON ");
+		append_column(&out, s->alias, "id");
+		sqlbuf_append(&out, " = ");
+		append_column(&out, edge, ends[k].idcol);
+	}
+
+	/* Endpoint label predicates and the lower-bound depth filter. */
+	int pfirst = 1;
+	for (int k = 0; k < 2; k++) {
+		Slot *s = &slots[ends[k].slot];
+		if (!s->label)
+			continue;
+		if (!pfirst)
+			sqlbuf_append(&pred, " AND ");
+		pfirst = 0;
+		append_column(&pred, edge, ends[k].namecol);
+		sqlbuf_append(&pred, " = ");
+		append_string(&pred, s->label);
+	}
+	if (min > 1) {
+		char buf[32];
+		if (!pfirst)
+			sqlbuf_append(&pred, " AND ");
+		pfirst = 0;
+		append_column(&pred, edge, "depth");
+		snprintf(buf, sizeof buf, " >= %d", min);
+		sqlbuf_append(&pred, buf);
+	}
+
+	int have_pred = pred.len > 0;
+	int have_user = uw.len > 0;
+	if (have_pred || have_user) {
+		sqlbuf_append(&out, " WHERE ");
+		if (have_pred)
+			sqlbuf_append(&out, pred.data);
+		if (have_pred && have_user)
+			sqlbuf_append(&out, " AND ");
+		if (have_user)
+			sqlbuf_append(&out, uw.data);
+	}
+	if (grp.len > 0)
+		sqlbuf_append(&out, grp.data);
+	if (ord.len > 0)
+		sqlbuf_append(&out, ord.data);
+	emit_limit_offset(&out, r);
+
+	*sql = sqlbuf_detach(&out);
+	rc = 0;
+
+done:
+	sqlbuf_free(&sel);
+	sqlbuf_free(&uw);
+	sqlbuf_free(&pred);
+	sqlbuf_free(&grp);
+	sqlbuf_free(&ord);
+	sqlbuf_free(&out);
+	return rc;
+}
+
 /* ------------------------------------------------------------- entry point --- */
 
 int transform_query(const Query *q, const Catalog *cat,
@@ -1094,20 +1358,27 @@ int transform_query(const Query *q, const Catalog *cat,
 	if (check_return_shape(q->ret, errmsg))
 		return 1;
 
-	/* Scan for the constructs handled specially or not yet: variable-length
-	 * paths (M8) and undirected hops. */
-	int has_undirected = 0, nseg = 0, npaths = 0;
+	/* Scan for the constructs handled by a dedicated engine: variable-length
+	 * paths (M8) and undirected hops, each supported as a single sole hop. */
+	int has_undirected = 0, has_varlen = 0, nseg = 0, npaths = 0;
 	for (PathList *pl = m->patterns; pl; pl = pl->next) {
 		npaths++;
 		for (Segment *s = pl->path->segments; s; s = s->next) {
 			nseg++;
 			if (s->rel->varlen.present)
-				return fail(errmsg,
-					"variable-length relationships are not "
-					"supported yet");
+				has_varlen = 1;
 			if (s->rel->dir == REL_UNDIR)
 				has_undirected = 1;
 		}
+	}
+
+	if (has_varlen) {
+		if (npaths != 1 || nseg != 1)
+			return fail(errmsg, "variable-length relationships are "
+				"only supported as a single hop");
+		const Path *p = m->patterns->path;
+		return transform_varlen(p->start, p->segments->rel,
+			p->segments->node, q->ret, m->where, cat, sql, errmsg);
 	}
 
 	if (has_undirected) {

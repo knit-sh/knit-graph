@@ -36,6 +36,21 @@ reject() {
 	fi
 }
 
+# expecth QUERY <<'EOF' ... EOF : like expect, but the expected SQL is read from
+# a quoted heredoc, sparing the variable-length CTE's many single quotes from the
+# '"'"' escaping dance. Command substitution trims the heredoc's trailing
+# newline, matching the trim applied to the captured output.
+expecth() {
+	exp=$(cat)
+	got=$("$KG" --explain "$db" "$1" 2>&1)
+	if [ "$got" != "$exp" ]; then
+		echo "FAIL: $1"
+		echo "  expected: $exp"
+		echo "  got:      $got"
+		fail=1
+	fi
+}
+
 # Single node.
 expect 'MATCH (a:`ns:f`) RETURN a.x' \
 	'SELECT a."x" FROM "ns:f" a'
@@ -121,6 +136,36 @@ expect 'MATCH (a:`ns:f`) RETURN a.x ORDER BY a.x SKIP 1 LIMIT 2' \
 expect 'MATCH (a:`ns:f`) RETURN a.x SKIP 1' \
 	'SELECT a."x" FROM "ns:f" a LIMIT -1 OFFSET 1'
 
+# Variable-length paths -> recursive CTE (M8). The walk carries the fixed
+# source, the current frontier, a depth and the set of edges used (edge rowids,
+# for relationship-uniqueness / termination). The outer query treats the walk
+# like one edge instance, so endpoint joins, label predicates and the RETURN
+# tail are the same as elsewhere.
+# Bounded *1..3: the upper bound is a `depth <` guard inside the recursion.
+expecth 'MATCH (a:`ns:f`)-[:calls*1..3]->(b:`ns2:g`) RETURN a.id, b.id' <<'EOF'
+WITH RECURSIVE "walk"(source_id, source_name, target_id, target_name, depth, path) AS (SELECT e."source_id", e."source_name", e."target_id", e."target_name", 1, '/' || e.rowid || '/' FROM "__provenance__" e WHERE e."edge_type" = 'calls' UNION ALL SELECT w."source_id", w."source_name", e."target_id", e."target_name", w."depth" + 1, w."path" || e.rowid || '/' FROM "walk" w JOIN "__provenance__" e ON e."source_id" = w."target_id" AND e."source_name" = w."target_name" WHERE e."edge_type" = 'calls' AND w."depth" < 3 AND w."path" NOT LIKE '%/' || e.rowid || '/%') SELECT a."id", b."id" FROM "walk" r JOIN "ns:f" a ON a."id" = r."source_id" JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."source_name" = 'ns:f' AND r."target_name" = 'ns2:g'
+EOF
+# Unbounded *: no depth guard; termination rests on edge-uniqueness alone.
+expecth 'MATCH (a:`ns:f`)-[:calls*]->(b:`ns2:g`) RETURN b.id' <<'EOF'
+WITH RECURSIVE "walk"(source_id, source_name, target_id, target_name, depth, path) AS (SELECT e."source_id", e."source_name", e."target_id", e."target_name", 1, '/' || e.rowid || '/' FROM "__provenance__" e WHERE e."edge_type" = 'calls' UNION ALL SELECT w."source_id", w."source_name", e."target_id", e."target_name", w."depth" + 1, w."path" || e.rowid || '/' FROM "walk" w JOIN "__provenance__" e ON e."source_id" = w."target_id" AND e."source_name" = w."target_name" WHERE e."edge_type" = 'calls' AND w."path" NOT LIKE '%/' || e.rowid || '/%') SELECT b."id" FROM "walk" r JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."source_name" = 'ns:f' AND r."target_name" = 'ns2:g'
+EOF
+# Reversed '<-' with a lower bound *2..4: the endpoints map to the opposite
+# edge sides, and the lower bound becomes a `depth >=` filter on the outer query.
+expecth 'MATCH (a:`ns:f`)<-[:calls*2..4]-(b:`ns2:g`) RETURN a.id' <<'EOF'
+WITH RECURSIVE "walk"(source_id, source_name, target_id, target_name, depth, path) AS (SELECT e."source_id", e."source_name", e."target_id", e."target_name", 1, '/' || e.rowid || '/' FROM "__provenance__" e WHERE e."edge_type" = 'calls' UNION ALL SELECT w."source_id", w."source_name", e."target_id", e."target_name", w."depth" + 1, w."path" || e.rowid || '/' FROM "walk" w JOIN "__provenance__" e ON e."source_id" = w."target_id" AND e."source_name" = w."target_name" WHERE e."edge_type" = 'calls' AND w."depth" < 4 AND w."path" NOT LIKE '%/' || e.rowid || '/%') SELECT a."id" FROM "walk" r JOIN "ns:f" a ON a."id" = r."target_id" WHERE r."source_name" = 'ns2:g' AND r."target_name" = 'ns:f' AND r."depth" >= 2
+EOF
+# The RETURN tail (WHERE + ORDER BY) composes with a var-length hop unchanged.
+expecth 'MATCH (a:`ns:f`)-[:chain*..2]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id ORDER BY b.id' <<'EOF'
+WITH RECURSIVE "walk"(source_id, source_name, target_id, target_name, depth, path) AS (SELECT e."source_id", e."source_name", e."target_id", e."target_name", 1, '/' || e.rowid || '/' FROM "__provenance__" e WHERE e."edge_type" = 'chain' UNION ALL SELECT w."source_id", w."source_name", e."target_id", e."target_name", w."depth" + 1, w."path" || e.rowid || '/' FROM "walk" w JOIN "__provenance__" e ON e."source_id" = w."target_id" AND e."source_name" = w."target_name" WHERE e."edge_type" = 'chain' AND w."depth" < 2 AND w."path" NOT LIKE '%/' || e.rowid || '/%') SELECT b."id" FROM "walk" r JOIN "ns:f" a ON a."id" = r."source_id" JOIN "ns:f" b ON b."id" = r."target_id" WHERE r."source_name" = 'ns:f' AND r."target_name" = 'ns:f' AND a."id" = 'f1' ORDER BY b."id"
+EOF
+
+# M8 errors.
+reject 'MATCH (a:`ns:f`)-[:calls*0..2]->(b:`ns:f`) RETURN b.id'          # lower bound < 1
+reject 'MATCH (a:`ns:f`)-[:calls*3..2]->(b:`ns:f`) RETURN b.id'          # lower > upper
+reject 'MATCH (a:`ns:f`)-[r:calls*1..2]->(b:`ns:f`) RETURN b.id'         # bound rel variable
+reject 'MATCH (a:`ns:f`)-[:calls*1..2]-(b:`ns:f`) RETURN b.id'           # undirected var-length
+reject 'MATCH (a:`ns:f`)-[:calls*1..2]->(b:`ns2:g`)-[:wraps]->(c) RETURN b.id'  # var-length not sole hop
+
 # M7 errors.
 reject 'MATCH (a:`ns:f`) RETURN foo(a.x)'          # unknown aggregate
 reject 'MATCH (a:`ns:f`) RETURN sum(a.x, a.y)'     # aggregate arity
@@ -141,7 +186,6 @@ reject 'MATCH (a:`nope:x`) RETURN a.id'      # unknown table
 reject 'MATCH (a) RETURN a.x'                # node has no label
 
 # Not-yet-supported constructs must be rejected, not mistranslated.
-reject 'MATCH (a)-[:calls*1..3]->(b) RETURN b.id'    # var-length (M8)
 reject 'MATCH (a:`ns:f`) RETURN a'           # whole-node RETURN (M9)
 
 rm -f "$db"

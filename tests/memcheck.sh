@@ -93,6 +93,21 @@ if make_fixture "$db"; then
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.x LIMIT a.x"
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.x ORDER BY zzz"
 
+	# Variable-length paths / recursive CTE (M8): bounded, unbounded and
+	# reversed translations, the full execution path over the fixture's 'chain'
+	# cycle (unbounded exercises the edge-uniqueness termination guard), and
+	# error paths (bad bounds, bound rel var, undirected, not the sole hop).
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)-[:calls*1..3]->(b:\`ns2:g\`) RETURN a.id, b.id"
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)-[:calls*]->(b:\`ns2:g\`) RETURN b.id"
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)<-[:calls*2..4]-(b:\`ns2:g\`) RETURN a.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:chain*1..2]->(b:\`ns:f\`) WHERE a.id = 'f1' RETURN b.id ORDER BY b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:chain*]->(b:\`ns:f\`) WHERE a.id = 'f1' RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls*0..2]->(b:\`ns:f\`) RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls*3..2]->(b:\`ns:f\`) RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[r:calls*1..2]->(b:\`ns:f\`) RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls*1..2]-(b:\`ns:f\`) RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls*1..2]->(b:\`ns2:g\`)-[:wraps]->(c) RETURN b.id"
+
 	rm -f "$db"
 fi
 
