@@ -82,6 +82,25 @@ expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE r.alias IS NULL RETURN a.i
 expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE b.z > 1 RETURN a.id' \
 	'SELECT a."id" FROM "__provenance__" r JOIN "ns:f" a ON a."id" = r."source_id" JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' AND b."z" > 1'
 
+# Chains, undirected & multi-pattern MATCH (M6).
+# A two-hop chain: the second edge JOINs __provenance__ and ties its source to
+# the first edge's target (the shared node b); each returned node joins its table.
+expect 'MATCH (a:`ns:f`)-[r1:calls]->(b:`ns2:g`)-[r2:wraps]->(c:`ns:f`) RETURN a.id, c.id' \
+	'SELECT a."id", c."id" FROM "__provenance__" r1 JOIN "__provenance__" r2 ON r2."source_id" = r1."target_id" AND r2."source_name" = r1."target_name" JOIN "ns:f" a ON a."id" = r1."source_id" JOIN "ns:f" c ON c."id" = r2."target_id" WHERE r1."edge_type" = '"'"'calls'"'"' AND r1."source_name" = '"'"'ns:f'"'"' AND r1."target_name" = '"'"'ns2:g'"'"' AND r2."edge_type" = '"'"'wraps'"'"' AND r2."source_name" = '"'"'ns2:g'"'"' AND r2."target_name" = '"'"'ns:f'"'"''
+# An undirected hop: OR over both orientations of the edge.
+expect 'MATCH (a:`ns2:g`)-[r:calls]-(b:`ns:f`) RETURN a.id, b.id' \
+	'SELECT a."id", b."id" FROM "__provenance__" r JOIN "ns2:g" a ON 1 = 1 JOIN "ns:f" b ON 1 = 1 WHERE r."edge_type" = '"'"'calls'"'"' AND (r."source_id" = a."id" AND r."source_name" = '"'"'ns2:g'"'"' AND r."target_id" = b."id" AND r."target_name" = '"'"'ns:f'"'"' OR r."target_id" = a."id" AND r."target_name" = '"'"'ns2:g'"'"' AND r."source_id" = b."id" AND r."source_name" = '"'"'ns:f'"'"')'
+# Comma-separated patterns in one MATCH: a cross product of the two node tables.
+expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN a.id, b.id' \
+	'SELECT a."id", b."id" FROM "ns:f" a JOIN "ns2:g" b ON 1 = 1'
+# A bare `--` (undirected, untyped): only the endpoint labels constrain the OR;
+# an unreferenced endpoint contributes just its name, a referenced one its id too.
+expect 'MATCH (a:`ns:f`)--(b:`ns2:g`) RETURN a.id' \
+	'SELECT a."id" FROM "__provenance__" r JOIN "ns:f" a ON 1 = 1 WHERE (r."source_id" = a."id" AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' OR r."target_id" = a."id" AND r."target_name" = '"'"'ns:f'"'"' AND r."source_name" = '"'"'ns2:g'"'"')'
+
+# Undirected is only supported as a single, sole hop for now.
+reject 'MATCH (a:`ns:f`)-[:calls]->(b:`ns2:g`)-[:wraps]-(c:`ns:f`) RETURN a.id'  # undirected in a chain
+
 # WHERE resolution/scope errors.
 reject 'MATCH (a:`ns:f`) WHERE a.nope = 1 RETURN a.id'         # unknown column
 reject 'MATCH (a:`ns:f`) WHERE a.y STARTS WITH a.x RETURN a.y' # needs a literal
@@ -93,7 +112,6 @@ reject 'MATCH (a:`nope:x`) RETURN a.id'      # unknown table
 reject 'MATCH (a) RETURN a.x'                # node has no label
 
 # Not-yet-supported constructs must be rejected, not mistranslated.
-reject 'MATCH (a:`ns:f`)--(b:`ns2:g`) RETURN a.id'   # undirected (M6)
 reject 'MATCH (a)-[:calls*1..3]->(b) RETURN b.id'    # var-length (M8)
 reject 'MATCH (a:`ns:f`) RETURN a'           # whole-node RETURN (M9)
 

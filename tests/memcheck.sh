@@ -71,6 +71,15 @@ if make_fixture "$db"; then
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) WHERE a.nope = 1 RETURN a.id"
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) WHERE a.y STARTS WITH a.x RETURN a.y"
 
+	# Pattern engine (M6): a two-hop chain, an undirected hop, a multi-pattern
+	# match, and error paths (undirected in a chain, conflicting labels).
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)-[r1:calls]->(b:\`ns2:g\`)-[r2:wraps]->(c:\`ns:f\`) WHERE a.x = 1 RETURN a.id, c.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls]->(b:\`ns2:g\`)-[:wraps]->(c:\`ns:f\`) RETURN a.id, c.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns2:g\`)-[r:calls]-(b:\`ns:f\`) RETURN a.id, b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`), (b:\`ns2:g\`) RETURN a.id, b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls]->(b)-[:wraps]-(c) RETURN a.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls]->(a:\`ns2:g\`) RETURN a.id"
+
 	rm -f "$db"
 fi
 

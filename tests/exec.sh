@@ -63,6 +63,17 @@ expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE r.alias IS NULL RETURN a.i
 # A WHERE reference to b joins it in; z=1.5 fails z>2.0, so no data rows.
 expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE b.z > 2.0 RETURN a.id' 'id\n'
 
+# Chains, undirected & multi-pattern (M6).
+# Two-hop chain f1 -calls-> g1 -wraps-> f2.
+expect 'MATCH (a:`ns:f`)-[r1:calls]->(b:`ns2:g`)-[r2:wraps]->(c:`ns:f`) RETURN a.id, c.id' 'id|id\nf1|f2\n'
+# Undirected finds the calls edge regardless of the query's direction: the edge
+# is ns:f -> ns2:g, yet querying ns2:g--ns:f still matches it.
+expect 'MATCH (a:`ns2:g`)-[r:calls]-(b:`ns:f`) RETURN a.id, b.id' 'id|id\ng1|f1\n'
+# The directed form of the same query matches nothing (header only).
+expect 'MATCH (a:`ns2:g`)-[r:calls]->(b:`ns:f`) RETURN a.id, b.id' 'id|id\n'
+# Comma-separated patterns cross-join: two ns:f rows x one ns2:g row.
+expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN a.id, b.id' 'id|id\nf1|g1\nf2|g1\n'
+
 # Errors still propagate on the execution path (unknown column, write clause,
 # unknown column inside WHERE).
 reject 'MATCH (a:`ns:f`) RETURN a.nope'

@@ -1,5 +1,5 @@
 /*
- * transform.c -- AST -> SQL for the Cypher shapes knit-graph understands so far:
+ * transform.c -- AST -> SQL for the Cypher pattern shapes knit-graph handles.
  *
  *   MATCH (a:`ns:f`) RETURN a.x
  *       -> SELECT a."x" FROM "ns:f" a
@@ -12,20 +12,32 @@
  *
  * A relationship maps to a row of the __provenance__ edge table; each labelled
  * endpoint contributes a source_name/target_name predicate, and a JOIN back to
- * the function table only when that node's own columns are used. `<-` swaps the
- * source and target roles.
+ * the function table only when that node's own columns are used. `->`/`<-` fix
+ * which endpoint is the source and which the target.
+ *
+ * The engine is general over patterns (M6): a MATCH may hold several
+ * comma-separated paths, each a chain of any length.  Every relationship is one
+ * __provenance__ instance; the first is the FROM, the rest are JOINed.  Each
+ * node is a "slot", identified by its variable (anonymous nodes are per
+ * occurrence).  A slot's identity is anchored to the first edge/side it appears
+ * on; a later edge touching the same slot is tied to that anchor with
+ * `edge.<side>_id = anchor.<side>_id AND edge.<side>_name = anchor.<side>_name`
+ * (this is how `(a)-[]->(b)-[]->(c)` chains, and how a shared variable across
+ * comma patterns joins).  A node whose columns are used is JOINed to its
+ * function table; a node standing alone in a path (no relationship) becomes its
+ * own FROM/cross-joined table.
+ *
+ * An undirected hop `(a)-[r]-(b)` is translated separately as an OR over both
+ * orientations; it is supported only as a single, sole hop for now.
  *
  * A WHERE clause (M5) is translated to a boolean SQL expression -- comparisons
  * (= <> < > <= >=), AND/OR/NOT, IN (...), IS [NOT] NULL, STARTS WITH / ENDS
  * WITH / CONTAINS (-> LIKE), and literals (safely quoted) -- and ANDed onto the
- * pattern predicates. Property references in WHERE are resolved against the
- * catalog exactly like those in RETURN, and cause the owning node's table to be
- * joined in.
+ * pattern predicates.  Property references in WHERE resolve exactly like those
+ * in RETURN and cause the owning node's table to be joined in.
  *
- * Anything beyond a single node or single hop -- chains, undirected or
- * variable-length relationships, multiple labels/types, inline property maps,
- * aggregation, DISTINCT, ORDER BY/SKIP/LIMIT, RETURN of a whole entity -- is
- * rejected here; those arrive in later milestones.
+ * Variable-length relationships, aggregation, DISTINCT, ORDER BY/SKIP/LIMIT and
+ * RETURN of a whole entity are rejected here; those arrive in later milestones.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -88,23 +100,50 @@ static void append_column(SqlBuf *b, const char *alias, const char *column)
 	append_ident(b, column);
 }
 
-/* --------------------------------------------------------------- bindings --- */
+/* --------------------------------------------------------------- model --- */
 
 /*
- * One entity the RETURN list or WHERE clause may refer to. Nodes carry the
- * function table they resolve to (from their single label) and whether they sit
- * on the source or target side of the edge; the edge itself resolves to
- * __provenance__.
+ * One node the pattern refers to. A node is identified across the whole query
+ * by its variable name; anonymous nodes are identified per occurrence. `label`
+ * is its function table (from its single label); `alias` is the SQL alias used
+ * for that table. A node is anchored to the first edge/side it appears on
+ * (anchor_edge == -1 means it never touches an edge -- a lone node with its own
+ * table). `referenced` records that a column of the node is used, so its table
+ * must be joined in.
  */
 typedef struct {
-	const char *var;    /* user variable name */
-	const char *table;  /* resolved table, for column validation */
-	int is_node;
-	int is_target;      /* nodes: 0 = source side, 1 = target side */
-	int referenced;     /* a property of this entity appears in RETURN/WHERE */
-} Binding;
+	const char    *var;           /* NULL if anonymous */
+	const NodePat *np;            /* first occurrence, for anonymous identity */
+	const char    *label;         /* resolved table, or NULL */
+	const char    *alias;         /* SQL alias for the table */
+	int            referenced;
+	int            is_lone;       /* never an edge endpoint -> own table */
+	int            anchor_edge;   /* index into edges[]; -1 if lone */
+	int            anchor_target; /* anchored on the target side? */
+} Slot;
 
-static Binding *find_binding(Binding *binds, int n, const char *var)
+/* One relationship: a row of __provenance__ tying a source slot to a target. */
+typedef struct {
+	const char *var;   /* NULL if anonymous */
+	const char *alias; /* SQL alias for the edge table */
+	const char *type;  /* edge_type literal, or NULL */
+	int         src;   /* source slot index */
+	int         tgt;   /* target slot index */
+} Edge;
+
+/*
+ * A name the RETURN list or WHERE clause may refer to: a node slot (is_node,
+ * slot indexes into slots[]) or the edge table (is_node == 0). `table` drives
+ * column validation; it is NULL for a node without a label.
+ */
+typedef struct {
+	const char *var;
+	const char *table;
+	int         is_node;
+	int         slot;
+} Bind;
+
+static Bind *find_bind(Bind *binds, int n, const char *var)
 {
 	for (int i = 0; i < n; i++)
 		if (binds[i].var && strcmp(binds[i].var, var) == 0)
@@ -113,15 +152,15 @@ static Binding *find_binding(Binding *binds, int n, const char *var)
 }
 
 /*
- * Resolve a property reference (var.key) against the bindings and catalog,
- * emit `var."key"`, and mark the owning binding referenced (so the relationship
- * translator knows to join that node's table in). Shared by RETURN and WHERE.
+ * Resolve a property reference (var.key) against the binds and catalog, emit
+ * `var."key"`, and (for a node) mark its slot referenced so the translator
+ * joins that node's table in. Shared by RETURN and WHERE.
  */
 static int emit_property(SqlBuf *b, const char *var, const char *key,
-                        const Catalog *cat, Binding *binds, int nbinds,
+                        const Catalog *cat, Bind *binds, int nb, Slot *slots,
                         char **errmsg)
 {
-	Binding *bd = find_binding(binds, nbinds, var);
+	Bind *bd = find_bind(binds, nb, var);
 	if (!bd)
 		return fail(errmsg, "unknown variable: %s", var);
 	if (!bd->table)
@@ -134,12 +173,13 @@ static int emit_property(SqlBuf *b, const char *var, const char *key,
 	if (!catalog_table_has_column(t, key))
 		return fail(errmsg, "unknown column: %s.%s", bd->table, key);
 
-	bd->referenced = 1;
+	if (bd->is_node)
+		slots[bd->slot].referenced = 1;
 	append_column(b, var, key);
 	return 0;
 }
 
-/* Reject the constructs a single-node/single-rel translator cannot yet emit. */
+/* Reject the RETURN constructs a later milestone will add. */
 static int check_return_shape(const Return *r, char **errmsg)
 {
 	if (r->star)
@@ -169,11 +209,11 @@ static int check_node(const NodePat *n, char **errmsg)
 }
 
 /*
- * Resolve every RETURN property against the bindings and emit the SELECT list.
+ * Resolve every RETURN property against the binds and emit the SELECT list.
  * Marks referenced nodes so the caller knows which joins to emit.
  */
 static int emit_select(SqlBuf *sql, const Return *r, const Catalog *cat,
-                      Binding *binds, int nbinds, char **errmsg)
+                      Bind *binds, int nb, Slot *slots, char **errmsg)
 {
 	sqlbuf_append(sql, "SELECT ");
 	int first = 1;
@@ -183,7 +223,7 @@ static int emit_select(SqlBuf *sql, const Return *r, const Catalog *cat,
 		first = 0;
 
 		if (emit_property(sql, it->expr->var, it->expr->key, cat,
-				binds, nbinds, errmsg))
+				binds, nb, slots, errmsg))
 			return 1;
 
 		if (it->alias) {
@@ -253,17 +293,18 @@ static void append_like_pattern(SqlBuf *b, const char *pre, const char *s,
 }
 
 static int emit_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
-                    Binding *binds, int nbinds, char **errmsg);
+                    Bind *binds, int nb, Slot *slots, char **errmsg);
 
 /* left STARTS WITH/ENDS WITH/CONTAINS 'lit' -> left LIKE 'pattern' ESCAPE '\'. */
 static int emit_like(SqlBuf *b, const Expr *e, const char *pre, const char *post,
-                    const Catalog *cat, Binding *binds, int nbinds, char **errmsg)
+                    const Catalog *cat, Bind *binds, int nb, Slot *slots,
+                    char **errmsg)
 {
 	if (e->right->kind != EXPR_LITERAL || e->right->lit_kind != LIT_STRING)
 		return fail(errmsg,
 			"STARTS WITH / ENDS WITH / CONTAINS require a string literal");
 
-	if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+	if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 		return 1;
 	sqlbuf_append(b, " LIKE ");
 	append_like_pattern(b, pre, e->right->lit_text, post);
@@ -273,36 +314,36 @@ static int emit_like(SqlBuf *b, const Expr *e, const char *pre, const char *post
 
 /* Recursively emit a boolean/value expression as SQL. */
 static int emit_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
-                    Binding *binds, int nbinds, char **errmsg)
+                    Bind *binds, int nb, Slot *slots, char **errmsg)
 {
 	switch (e->kind) {
 	case EXPR_OR:
 	case EXPR_AND: {
 		const char *op = (e->kind == EXPR_OR) ? " OR " : " AND ";
 		sqlbuf_append_char(b, '(');
-		if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append(b, op);
-		if (emit_expr(b, e->right, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->right, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append_char(b, ')');
 		return 0;
 	}
 	case EXPR_NOT:
 		sqlbuf_append(b, "(NOT ");
-		if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append_char(b, ')');
 		return 0;
 	case EXPR_CMP:
-		if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append_char(b, ' ');
 		sqlbuf_append(b, cmp_op_sql(e->cmp));
 		sqlbuf_append_char(b, ' ');
-		return emit_expr(b, e->right, cat, binds, nbinds, errmsg);
+		return emit_expr(b, e->right, cat, binds, nb, slots, errmsg);
 	case EXPR_IN: {
-		if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append(b, " IN (");
 		int first = 1;
@@ -310,30 +351,31 @@ static int emit_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
 			if (!first)
 				sqlbuf_append(b, ", ");
 			first = 0;
-			if (emit_expr(b, l->expr, cat, binds, nbinds, errmsg))
+			if (emit_expr(b, l->expr, cat, binds, nb, slots, errmsg))
 				return 1;
 		}
 		sqlbuf_append_char(b, ')');
 		return 0;
 	}
 	case EXPR_IS_NULL:
-		if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append(b, " IS NULL");
 		return 0;
 	case EXPR_IS_NOT_NULL:
-		if (emit_expr(b, e->left, cat, binds, nbinds, errmsg))
+		if (emit_expr(b, e->left, cat, binds, nb, slots, errmsg))
 			return 1;
 		sqlbuf_append(b, " IS NOT NULL");
 		return 0;
 	case EXPR_STARTS_WITH:
-		return emit_like(b, e, "", "%", cat, binds, nbinds, errmsg);
+		return emit_like(b, e, "", "%", cat, binds, nb, slots, errmsg);
 	case EXPR_ENDS_WITH:
-		return emit_like(b, e, "%", "", cat, binds, nbinds, errmsg);
+		return emit_like(b, e, "%", "", cat, binds, nb, slots, errmsg);
 	case EXPR_CONTAINS:
-		return emit_like(b, e, "%", "%", cat, binds, nbinds, errmsg);
+		return emit_like(b, e, "%", "%", cat, binds, nb, slots, errmsg);
 	case EXPR_PROPERTY:
-		return emit_property(b, e->var, e->key, cat, binds, nbinds, errmsg);
+		return emit_property(b, e->var, e->key, cat, binds, nb, slots,
+			errmsg);
 	case EXPR_LITERAL:
 		emit_literal(b, e);
 		return 0;
@@ -346,199 +388,499 @@ static int emit_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
 	return fail(errmsg, "unsupported expression in WHERE");
 }
 
-/* ------------------------------------------------------------ single node --- */
+/* ---------------------------------------------------- general engine --- */
 
-static int transform_single_node(const NodePat *n, const Return *r,
-                                const Expr *where, const Catalog *cat,
-                                char **sql, char **errmsg)
+/* Allocate a small owned identifier (a generated alias). Aborts on OOM. */
+static char *own_alias(char **owned, int *nowned, const char *fmt, int n)
 {
-	if (check_node(n, errmsg))
-		return 1;
-	if (!n->labels)
-		return fail(errmsg,
-			"node has no label; cannot determine which table to query");
-
-	const char *table = n->labels->s;
-	if (!catalog_find_table(cat, table))
-		return fail(errmsg, "unknown table: %s", table);
-
-	const char *alias = n->var ? n->var : "n";
-	Binding b = { alias, table, 1, 0, 0 };
-
-	SqlBuf buf;
-	sqlbuf_init(&buf);
-	if (emit_select(&buf, r, cat, &b, 1, errmsg)) {
-		sqlbuf_free(&buf);
-		return 1;
+	char buf[32];
+	snprintf(buf, sizeof buf, fmt, n);
+	char *s = strdup(buf);
+	if (!s) {
+		fprintf(stderr, "knit-graph: out of memory\n");
+		exit(1);
 	}
-	sqlbuf_append(&buf, " FROM ");
-	append_ident(&buf, table);
-	sqlbuf_append_char(&buf, ' ');
-	sqlbuf_append(&buf, alias);
+	owned[(*nowned)++] = s;
+	return s;
+}
 
-	if (where) {
-		sqlbuf_append(&buf, " WHERE ");
-		if (emit_expr(&buf, where, cat, &b, 1, errmsg)) {
-			sqlbuf_free(&buf);
-			return 1;
+/*
+ * Find or create the slot for a node occurrence. Nodes are matched by variable
+ * name (so a variable shared across hops/patterns is one slot); anonymous nodes
+ * match by their AST pointer. On a repeat occurrence the label is merged, and a
+ * conflicting label is an error (returns -1).
+ */
+static int slot_for(Slot *slots, int *nslots, const NodePat *np, char **errmsg)
+{
+	for (int i = 0; i < *nslots; i++) {
+		int same = (np->var && slots[i].var
+				&& strcmp(slots[i].var, np->var) == 0)
+			|| (!np->var && !slots[i].var && slots[i].np == np);
+		if (!same)
+			continue;
+		if (np->labels) {
+			const char *lbl = np->labels->s;
+			if (slots[i].label && strcmp(slots[i].label, lbl) != 0) {
+				fail(errmsg, "conflicting labels for '%s'",
+					np->var ? np->var : "(anonymous)");
+				return -1;
+			}
+			slots[i].label = lbl;
+		}
+		return i;
+	}
+
+	int i = (*nslots)++;
+	slots[i].var = np->var;
+	slots[i].np = np;
+	slots[i].label = np->labels ? np->labels->s : NULL;
+	slots[i].alias = np->var;
+	slots[i].referenced = 0;
+	slots[i].is_lone = 0;
+	slots[i].anchor_edge = -1;
+	slots[i].anchor_target = 0;
+	return i;
+}
+
+/*
+ * If slot `sl` -- appearing on `side_target` of edge `ei` -- was anchored to an
+ * earlier edge, emit the id/name equality tying this edge's side to that anchor.
+ */
+static void emit_tie(SqlBuf *b, int *first, const Edge *edges, int ei,
+                    int sl, int side_target, const Slot *slots)
+{
+	if (slots[sl].anchor_edge == ei)
+		return; /* anchored here: this edge defines the slot's identity */
+
+	const Edge *ae = &edges[slots[sl].anchor_edge];
+	const char *side_id   = side_target ? "target_id"   : "source_id";
+	const char *side_name = side_target ? "target_name" : "source_name";
+	const char *anc_id    = slots[sl].anchor_target ? "target_id"   : "source_id";
+	const char *anc_name  = slots[sl].anchor_target ? "target_name" : "source_name";
+
+	if (!*first)
+		sqlbuf_append(b, " AND ");
+	*first = 0;
+	append_column(b, edges[ei].alias, side_id);
+	sqlbuf_append(b, " = ");
+	append_column(b, ae->alias, anc_id);
+	sqlbuf_append(b, " AND ");
+	append_column(b, edges[ei].alias, side_name);
+	sqlbuf_append(b, " = ");
+	append_column(b, ae->alias, anc_name);
+}
+
+static int transform_general(const Match *m, const Return *r,
+                            const Catalog *cat, char **sql, char **errmsg)
+{
+	/* Upper bounds: one slot per node occurrence, one edge per segment. */
+	int cap_nodes = 0, cap_edges = 0;
+	for (PathList *pl = m->patterns; pl; pl = pl->next) {
+		cap_nodes++;
+		for (Segment *s = pl->path->segments; s; s = s->next) {
+			cap_nodes++;
+			cap_edges++;
 		}
 	}
 
-	*sql = sqlbuf_detach(&buf);
-	return 0;
+	Slot *slots = calloc((size_t)cap_nodes + 1, sizeof *slots);
+	Edge *edges = calloc((size_t)cap_edges + 1, sizeof *edges);
+	Bind *binds = calloc((size_t)cap_nodes + cap_edges + 1, sizeof *binds);
+	char **owned = calloc((size_t)cap_nodes + cap_edges + 1, sizeof *owned);
+	if (!slots || !edges || !binds || !owned) {
+		fprintf(stderr, "knit-graph: out of memory\n");
+		exit(1);
+	}
+	int nslots = 0, nedges = 0, nb = 0, nowned = 0, rc = 1;
+
+	SqlBuf sel, uw, from, pred, out;
+	sqlbuf_init(&sel);
+	sqlbuf_init(&uw);
+	sqlbuf_init(&from);
+	sqlbuf_init(&pred);
+	sqlbuf_init(&out);
+
+	/* Collect slots and edges, and anchor each slot to its first edge. */
+	for (PathList *pl = m->patterns; pl; pl = pl->next) {
+		Path *p = pl->path;
+		if (check_node(p->start, errmsg))
+			goto done;
+		int prev = slot_for(slots, &nslots, p->start, errmsg);
+		if (prev < 0)
+			goto done;
+
+		for (Segment *s = p->segments; s; s = s->next) {
+			RelPat *rel = s->rel;
+			if (check_node(s->node, errmsg))
+				goto done;
+			if (rel->props) {
+				fail(errmsg,
+					"inline property maps are not supported yet");
+				goto done;
+			}
+			if (rel->types && rel->types->next) {
+				fail(errmsg,
+					"multiple relationship types are not supported yet");
+				goto done;
+			}
+
+			int cur = slot_for(slots, &nslots, s->node, errmsg);
+			if (cur < 0)
+				goto done;
+
+			int src, tgt;
+			if (rel->dir == REL_LEFT) {
+				src = cur;
+				tgt = prev;
+			} else { /* REL_RIGHT */
+				src = prev;
+				tgt = cur;
+			}
+			int ei = nedges++;
+			edges[ei].var = rel->var;
+			edges[ei].type = rel->types ? rel->types->s : NULL;
+			edges[ei].src = src;
+			edges[ei].tgt = tgt;
+			if (slots[src].anchor_edge == -1) {
+				slots[src].anchor_edge = ei;
+				slots[src].anchor_target = 0;
+			}
+			if (slots[tgt].anchor_edge == -1) {
+				slots[tgt].anchor_edge = ei;
+				slots[tgt].anchor_target = 1;
+			}
+			prev = cur;
+		}
+	}
+
+	/* Name each edge (variable, or a generated alias) . */
+	for (int i = 0; i < nedges; i++) {
+		if (edges[i].var)
+			edges[i].alias = edges[i].var;
+		else if (nedges == 1)
+			edges[i].alias = "r";
+		else
+			edges[i].alias = own_alias(owned, &nowned, "_e%d", i);
+	}
+
+	/* Mark lone nodes, validate labels resolve, and give lone nodes aliases. */
+	for (int i = 0; i < nslots; i++) {
+		slots[i].is_lone = (slots[i].anchor_edge == -1);
+		if (slots[i].label && !catalog_find_table(cat, slots[i].label)) {
+			fail(errmsg, "unknown table: %s", slots[i].label);
+			goto done;
+		}
+		if (slots[i].is_lone) {
+			if (!slots[i].label) {
+				fail(errmsg, "node has no label; cannot determine "
+					"which table to query");
+				goto done;
+			}
+			if (!slots[i].alias)
+				slots[i].alias =
+					own_alias(owned, &nowned, "_n%d", i);
+		}
+	}
+
+	/* Binds for RETURN/WHERE resolution: node slots and edges by variable. */
+	for (int i = 0; i < nslots; i++)
+		if (slots[i].var)
+			binds[nb++] = (Bind){ slots[i].var, slots[i].label, 1, i };
+	for (int i = 0; i < nedges; i++)
+		if (edges[i].var)
+			binds[nb++] = (Bind){ edges[i].var, KG_EDGE_TABLE, 0, -1 };
+
+	/* SELECT and the user WHERE, emitted before the joins so any node they
+	 * reference is marked and gets its table joined in. */
+	if (emit_select(&sel, r, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (m->where && emit_expr(&uw, m->where, cat, binds, nb, slots, errmsg))
+		goto done;
+
+	/* FROM: the first edge (or, edgeless, the first lone node) is the base;
+	 * further edges JOIN on their ties, further lone nodes cross-join. */
+	int base_done = 0;
+	if (nedges > 0) {
+		sqlbuf_append(&from, " FROM ");
+		append_ident(&from, KG_EDGE_TABLE);
+		sqlbuf_append_char(&from, ' ');
+		sqlbuf_append(&from, edges[0].alias);
+		base_done = 1;
+		for (int i = 1; i < nedges; i++) {
+			sqlbuf_append(&from, " JOIN ");
+			append_ident(&from, KG_EDGE_TABLE);
+			sqlbuf_append_char(&from, ' ');
+			sqlbuf_append(&from, edges[i].alias);
+			sqlbuf_append(&from, " ON ");
+			int tfirst = 1;
+			emit_tie(&from, &tfirst, edges, i, edges[i].src, 0, slots);
+			emit_tie(&from, &tfirst, edges, i, edges[i].tgt, 1, slots);
+			if (tfirst)
+				sqlbuf_append(&from, "1 = 1");
+		}
+	}
+	for (int i = 0; i < nslots; i++) {
+		if (!slots[i].is_lone)
+			continue;
+		if (!base_done) {
+			sqlbuf_append(&from, " FROM ");
+			append_ident(&from, slots[i].label);
+			sqlbuf_append_char(&from, ' ');
+			sqlbuf_append(&from, slots[i].alias);
+			base_done = 1;
+		} else {
+			sqlbuf_append(&from, " JOIN ");
+			append_ident(&from, slots[i].label);
+			sqlbuf_append_char(&from, ' ');
+			sqlbuf_append(&from, slots[i].alias);
+			sqlbuf_append(&from, " ON 1 = 1");
+		}
+	}
+	/* Referenced non-lone nodes: join their function table to their anchor. */
+	for (int i = 0; i < nslots; i++) {
+		if (slots[i].is_lone || !slots[i].referenced)
+			continue;
+		const Edge *ae = &edges[slots[i].anchor_edge];
+		const char *idcol =
+			slots[i].anchor_target ? "target_id" : "source_id";
+		sqlbuf_append(&from, " JOIN ");
+		append_ident(&from, slots[i].label);
+		sqlbuf_append_char(&from, ' ');
+		sqlbuf_append(&from, slots[i].alias);
+		sqlbuf_append(&from, " ON ");
+		append_column(&from, slots[i].alias, "id");
+		sqlbuf_append(&from, " = ");
+		append_column(&from, ae->alias, idcol);
+	}
+
+	/* Pattern predicates: per edge, its type and its labelled endpoints. */
+	int pfirst = 1;
+	for (int i = 0; i < nedges; i++) {
+		if (edges[i].type) {
+			if (!pfirst)
+				sqlbuf_append(&pred, " AND ");
+			pfirst = 0;
+			append_column(&pred, edges[i].alias, "edge_type");
+			sqlbuf_append(&pred, " = ");
+			append_string(&pred, edges[i].type);
+		}
+		const char *sl = slots[edges[i].src].label;
+		if (sl) {
+			if (!pfirst)
+				sqlbuf_append(&pred, " AND ");
+			pfirst = 0;
+			append_column(&pred, edges[i].alias, "source_name");
+			sqlbuf_append(&pred, " = ");
+			append_string(&pred, sl);
+		}
+		const char *tl = slots[edges[i].tgt].label;
+		if (tl) {
+			if (!pfirst)
+				sqlbuf_append(&pred, " AND ");
+			pfirst = 0;
+			append_column(&pred, edges[i].alias, "target_name");
+			sqlbuf_append(&pred, " = ");
+			append_string(&pred, tl);
+		}
+	}
+
+	sqlbuf_append(&out, sel.data ? sel.data : "");
+	sqlbuf_append(&out, from.data ? from.data : "");
+	int have_pred = pred.len > 0;
+	int have_user = uw.len > 0;
+	if (have_pred || have_user) {
+		sqlbuf_append(&out, " WHERE ");
+		if (have_pred)
+			sqlbuf_append(&out, pred.data);
+		if (have_pred && have_user)
+			sqlbuf_append(&out, " AND ");
+		if (have_user)
+			sqlbuf_append(&out, uw.data);
+	}
+
+	*sql = sqlbuf_detach(&out);
+	rc = 0;
+
+done:
+	sqlbuf_free(&sel);
+	sqlbuf_free(&uw);
+	sqlbuf_free(&from);
+	sqlbuf_free(&pred);
+	sqlbuf_free(&out);
+	for (int i = 0; i < nowned; i++)
+		free(owned[i]);
+	free(owned);
+	free(slots);
+	free(edges);
+	free(binds);
+	return rc;
 }
 
-/* ------------------------------------------------------ single relationship --- */
+/* ------------------------------------------------------ undirected hop --- */
 
-/* Build the label predicate for one endpoint, if it has a label. */
-static void emit_endpoint_predicate(SqlBuf *w, int *first, const char *edge,
-                                   const char *role, const char *label)
+/* Emit one endpoint's terms for a given edge side (id if joined, name if
+ * labelled), separated from earlier terms by " AND ". */
+static void orient_side(SqlBuf *o, int *first, const char *edge,
+                       const char *side, const Slot *s)
 {
-	if (!label)
-		return;
-	if (!*first)
-		sqlbuf_append(w, " AND ");
-	*first = 0;
-	append_column(w, edge, role);
-	sqlbuf_append(w, " = ");
-	append_string(w, label);
+	char idcol[16], namecol[16];
+	snprintf(idcol, sizeof idcol, "%s_id", side);
+	snprintf(namecol, sizeof namecol, "%s_name", side);
+
+	if (s->referenced) {
+		if (!*first)
+			sqlbuf_append(o, " AND ");
+		*first = 0;
+		append_column(o, edge, idcol);
+		sqlbuf_append(o, " = ");
+		append_column(o, s->alias, "id");
+	}
+	if (s->label) {
+		if (!*first)
+			sqlbuf_append(o, " AND ");
+		*first = 0;
+		append_column(o, edge, namecol);
+		sqlbuf_append(o, " = ");
+		append_string(o, s->label);
+	}
 }
 
-/* Emit the JOIN back to a node's function table, if that node is referenced. */
-static void emit_node_join(SqlBuf *f, const Binding *b, const char *edge)
+/* Build one orientation: node u on side `su`, node v on side `sv`. */
+static void build_orient(SqlBuf *o, const char *edge, const char *su,
+                        const char *sv, const Slot *u, const Slot *v)
 {
-	if (!b->is_node || !b->referenced || !b->table)
-		return;
-	sqlbuf_append(f, " JOIN ");
-	append_ident(f, b->table);
-	sqlbuf_append_char(f, ' ');
-	sqlbuf_append(f, b->var);
-	sqlbuf_append(f, " ON ");
-	append_column(f, b->var, "id");
-	sqlbuf_append(f, " = ");
-	append_column(f, edge, b->is_target ? "target_id" : "source_id");
+	int first = 1;
+	orient_side(o, &first, edge, su, u);
+	orient_side(o, &first, edge, sv, v);
 }
 
-static int transform_single_rel(const NodePat *left, const RelPat *rel,
-                              const NodePat *right, const Return *r,
-                              const Expr *where, const Catalog *cat,
-                              char **sql, char **errmsg)
+static int transform_undirected(const NodePat *left, const RelPat *rel,
+                               const NodePat *right, const Return *r,
+                               const Expr *where, const Catalog *cat,
+                               char **sql, char **errmsg)
 {
 	if (check_node(left, errmsg) || check_node(right, errmsg))
 		return 1;
 	if (rel->props)
 		return fail(errmsg, "inline property maps are not supported yet");
-	if (rel->varlen.present)
-		return fail(errmsg,
-			"variable-length relationships are not supported yet");
-	if (rel->dir == REL_UNDIR)
-		return fail(errmsg,
-			"undirected relationships are not supported yet");
 	if (rel->types && rel->types->next)
 		return fail(errmsg,
 			"multiple relationship types are not supported yet");
 
-	/* `->` : left is source, right is target. `<-` swaps the two. */
-	const NodePat *src = (rel->dir == REL_LEFT) ? right : left;
-	const NodePat *tgt = (rel->dir == REL_LEFT) ? left : right;
-	const char *src_label = src->labels ? src->labels->s : NULL;
-	const char *tgt_label = tgt->labels ? tgt->labels->s : NULL;
-
-	if (src_label && !catalog_find_table(cat, src_label))
-		return fail(errmsg, "unknown table: %s", src_label);
-	if (tgt_label && !catalog_find_table(cat, tgt_label))
-		return fail(errmsg, "unknown table: %s", tgt_label);
+	const char *u_label = left->labels ? left->labels->s : NULL;
+	const char *v_label = right->labels ? right->labels->s : NULL;
+	if (u_label && !catalog_find_table(cat, u_label))
+		return fail(errmsg, "unknown table: %s", u_label);
+	if (v_label && !catalog_find_table(cat, v_label))
+		return fail(errmsg, "unknown table: %s", v_label);
 
 	const char *edge = rel->var ? rel->var : "r";
+	const char *type = rel->types ? rel->types->s : NULL;
 
-	/* Bindings, in pattern order (left, then right), for RETURN/WHERE
-	 * resolution. The edge itself resolves to __provenance__ (no join). */
-	Binding binds[3];
+	/* Slot 0 = left (u), slot 1 = right (v). */
+	Slot slots[2];
+	memset(slots, 0, sizeof slots);
+	slots[0].var = left->var;
+	slots[0].label = u_label;
+	slots[0].alias = left->var;
+	slots[0].anchor_edge = -1;
+	slots[1].var = right->var;
+	slots[1].label = v_label;
+	slots[1].alias = right->var;
+	slots[1].anchor_edge = -1;
+
+	Bind binds[3];
 	int nb = 0;
 	if (left->var)
-		binds[nb++] = (Binding){ left->var,
-			left->labels ? left->labels->s : NULL, 1,
-			(rel->dir == REL_LEFT) ? 1 : 0, 0 };
+		binds[nb++] = (Bind){ left->var, u_label, 1, 0 };
 	if (right->var)
-		binds[nb++] = (Binding){ right->var,
-			right->labels ? right->labels->s : NULL, 1,
-			(rel->dir == REL_LEFT) ? 0 : 1, 0 };
+		binds[nb++] = (Bind){ right->var, v_label, 1, 1 };
 	if (rel->var)
-		binds[nb++] = (Binding){ rel->var, KG_EDGE_TABLE, 0, 0, 0 };
+		binds[nb++] = (Bind){ rel->var, KG_EDGE_TABLE, 0, -1 };
 
-	SqlBuf sel;
+	SqlBuf sel, uw, pred, o1, o2, out;
 	sqlbuf_init(&sel);
-	if (emit_select(&sel, r, cat, binds, nb, errmsg)) {
-		sqlbuf_free(&sel);
-		return 1;
-	}
+	sqlbuf_init(&uw);
+	sqlbuf_init(&pred);
+	sqlbuf_init(&o1);
+	sqlbuf_init(&o2);
+	sqlbuf_init(&out);
+	int rc = 1;
 
-	/* The user's WHERE, translated before the joins so any node it references
-	 * is marked and gets joined in. */
-	SqlBuf userwhere;
-	sqlbuf_init(&userwhere);
-	if (where && emit_expr(&userwhere, where, cat, binds, nb, errmsg)) {
-		sqlbuf_free(&sel);
-		sqlbuf_free(&userwhere);
-		return 1;
-	}
+	if (emit_select(&sel, r, cat, binds, nb, slots, errmsg))
+		goto done;
+	if (where && emit_expr(&uw, where, cat, binds, nb, slots, errmsg))
+		goto done;
 
-	/* A referenced node without a label has no table to join to. */
-	for (int i = 0; i < nb; i++) {
-		if (binds[i].referenced && !binds[i].table) {
-			sqlbuf_free(&sel);
-			sqlbuf_free(&userwhere);
-			return fail(errmsg,
+	/* A referenced endpoint needs a label to know which table to join. */
+	for (int i = 0; i < 2; i++) {
+		if (slots[i].referenced && !slots[i].label) {
+			fail(errmsg,
 				"cannot resolve columns of '%s': it has no label",
-				binds[i].var);
+				slots[i].var);
+			goto done;
 		}
 	}
 
-	SqlBuf from;
-	sqlbuf_init(&from);
-	sqlbuf_append(&from, " FROM ");
-	append_ident(&from, KG_EDGE_TABLE);
-	sqlbuf_append_char(&from, ' ');
-	sqlbuf_append(&from, edge);
-	for (int i = 0; i < nb; i++)
-		emit_node_join(&from, &binds[i], edge);
+	sqlbuf_append(&out, sel.data ? sel.data : "");
+	sqlbuf_append(&out, " FROM ");
+	append_ident(&out, KG_EDGE_TABLE);
+	sqlbuf_append_char(&out, ' ');
+	sqlbuf_append(&out, edge);
+	for (int i = 0; i < 2; i++) {
+		if (!slots[i].referenced)
+			continue;
+		sqlbuf_append(&out, " JOIN ");
+		append_ident(&out, slots[i].label);
+		sqlbuf_append_char(&out, ' ');
+		sqlbuf_append(&out, slots[i].alias);
+		sqlbuf_append(&out, " ON 1 = 1");
+	}
 
-	/* Pattern predicates: edge type and the labelled endpoints. */
-	SqlBuf predbuf;
-	sqlbuf_init(&predbuf);
 	int first = 1;
-	if (rel->types) {
-		append_column(&predbuf, edge, "edge_type");
-		sqlbuf_append(&predbuf, " = ");
-		append_string(&predbuf, rel->types->s);
+	if (type) {
+		append_column(&pred, edge, "edge_type");
+		sqlbuf_append(&pred, " = ");
+		append_string(&pred, type);
 		first = 0;
 	}
-	emit_endpoint_predicate(&predbuf, &first, edge, "source_name", src_label);
-	emit_endpoint_predicate(&predbuf, &first, edge, "target_name", tgt_label);
+	/* OR over both orientations of the undirected hop. */
+	build_orient(&o1, edge, "source", "target", &slots[0], &slots[1]);
+	build_orient(&o2, edge, "target", "source", &slots[0], &slots[1]);
+	if (o1.len > 0) {
+		if (!first)
+			sqlbuf_append(&pred, " AND ");
+		first = 0;
+		sqlbuf_append(&pred, "(");
+		sqlbuf_append(&pred, o1.data);
+		sqlbuf_append(&pred, " OR ");
+		sqlbuf_append(&pred, o2.data);
+		sqlbuf_append(&pred, ")");
+	}
 
-	SqlBuf out;
-	sqlbuf_init(&out);
-	sqlbuf_append(&out, sel.data ? sel.data : "");
-	sqlbuf_append(&out, from.data ? from.data : "");
-
-	int have_pred = predbuf.len > 0;
-	int have_user = userwhere.len > 0;
+	int have_pred = pred.len > 0;
+	int have_user = uw.len > 0;
 	if (have_pred || have_user) {
 		sqlbuf_append(&out, " WHERE ");
 		if (have_pred)
-			sqlbuf_append(&out, predbuf.data);
+			sqlbuf_append(&out, pred.data);
 		if (have_pred && have_user)
 			sqlbuf_append(&out, " AND ");
 		if (have_user)
-			sqlbuf_append(&out, userwhere.data);
+			sqlbuf_append(&out, uw.data);
 	}
 
-	sqlbuf_free(&sel);
-	sqlbuf_free(&userwhere);
-	sqlbuf_free(&from);
-	sqlbuf_free(&predbuf);
 	*sql = sqlbuf_detach(&out);
-	return 0;
+	rc = 0;
+
+done:
+	sqlbuf_free(&sel);
+	sqlbuf_free(&uw);
+	sqlbuf_free(&pred);
+	sqlbuf_free(&o1);
+	sqlbuf_free(&o2);
+	sqlbuf_free(&out);
+	return rc;
 }
 
 /* ------------------------------------------------------------- entry point --- */
@@ -554,20 +896,33 @@ int transform_query(const Query *q, const Catalog *cat,
 		return fail(errmsg, "multiple MATCH clauses are not supported yet");
 
 	const Match *m = q->matches;
-	if (m->patterns->next)
-		return fail(errmsg,
-			"multiple patterns in one MATCH are not supported yet");
-
 	if (check_return_shape(q->ret, errmsg))
 		return 1;
 
-	const Path *p = m->patterns->path;
-	if (p->segments == NULL)
-		return transform_single_node(p->start, q->ret, m->where,
-			cat, sql, errmsg);
-	if (p->segments->next == NULL)
-		return transform_single_rel(p->start, p->segments->rel,
-			p->segments->node, q->ret, m->where, cat, sql, errmsg);
+	/* Scan for the constructs handled specially or not yet: variable-length
+	 * paths (M8) and undirected hops. */
+	int has_undirected = 0, nseg = 0, npaths = 0;
+	for (PathList *pl = m->patterns; pl; pl = pl->next) {
+		npaths++;
+		for (Segment *s = pl->path->segments; s; s = s->next) {
+			nseg++;
+			if (s->rel->varlen.present)
+				return fail(errmsg,
+					"variable-length relationships are not "
+					"supported yet");
+			if (s->rel->dir == REL_UNDIR)
+				has_undirected = 1;
+		}
+	}
 
-	return fail(errmsg, "multi-hop patterns are not supported yet");
+	if (has_undirected) {
+		if (npaths != 1 || nseg != 1)
+			return fail(errmsg, "undirected relationships are only "
+				"supported as a single hop");
+		const Path *p = m->patterns->path;
+		return transform_undirected(p->start, p->segments->rel,
+			p->segments->node, q->ret, m->where, cat, sql, errmsg);
+	}
+
+	return transform_general(m, q->ret, cat, sql, errmsg);
 }

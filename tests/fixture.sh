@@ -28,6 +28,12 @@ INSERT INTO "ns:f"  (id, x, y) VALUES ('f1', 1, 'a'), ('f2', 2, 'b');
 INSERT INTO "ns2:g" (id, z)    VALUES ('g1', 1.5);
 INSERT INTO "__provenance__"
 	(source_id, source_name, target_id, target_name, edge_type, start_time, end_time, alias)
-VALUES ('f1', 'ns:f', 'g1', 'ns2:g', 'calls', 0.0, 1.0, NULL);
+VALUES
+	-- The 'calls' edge f1 -> g1 drives the single-hop tests.
+	('f1', 'ns:f', 'g1', 'ns2:g', 'calls', 0.0, 1.0, NULL),
+	-- A second edge of a *different* type, g1 -> f2, so f1 -calls-> g1 -wraps-> f2
+	-- is a two-hop chain. Its distinct edge_type keeps the 'calls'-only queries
+	-- (and the reversed-direction test) unaffected.
+	('g1', 'ns2:g', 'f2', 'ns:f', 'wraps', 0.0, 1.0, NULL);
 SQL
 }
