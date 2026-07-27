@@ -52,8 +52,21 @@ expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN r.alias' 'alias\n\n'
 # Reversed direction matches nothing here: header only, no data rows.
 expect 'MATCH (a:`ns:f`)<-[r:calls]-(b:`ns2:g`) RETURN b.id' 'id\n'
 
-# Errors still propagate on the execution path (unknown column, write clause).
+# WHERE (M5): filter the fixture rows.
+expect 'MATCH (a:`ns:f`) WHERE a.x = 2 RETURN a.x, a.y' 'x|y\n2|b\n'
+expect 'MATCH (a:`ns:f`) WHERE a.x > 1 RETURN a.id' 'id\nf2\n'
+expect 'MATCH (a:`ns:f`) WHERE NOT a.x = 1 RETURN a.id' 'id\nf2\n'
+expect 'MATCH (a:`ns:f`) WHERE a.x IN [1] RETURN a.id' 'id\nf1\n'
+expect 'MATCH (a:`ns:f`) WHERE a.y STARTS WITH "a" RETURN a.id' 'id\nf1\n'
+# A NULL relationship property tested with IS NULL still matches the edge.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE r.alias IS NULL RETURN a.id, b.id' 'id|id\nf1|g1\n'
+# A WHERE reference to b joins it in; z=1.5 fails z>2.0, so no data rows.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE b.z > 2.0 RETURN a.id' 'id\n'
+
+# Errors still propagate on the execution path (unknown column, write clause,
+# unknown column inside WHERE).
 reject 'MATCH (a:`ns:f`) RETURN a.nope'
+reject 'MATCH (a:`ns:f`) WHERE a.nope = 1 RETURN a.id'
 reject 'CREATE (a:`ns:f`) RETURN a.x'
 
 rm -f "$db" exec_got.out exec_exp.out

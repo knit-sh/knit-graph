@@ -63,6 +63,14 @@ if make_fixture "$db"; then
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN r.alias, b.id"
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a.nope"
 
+	# WHERE path (M5): a compound node filter, a rel filter joining b in via
+	# WHERE, a LIKE, and error paths (unknown column and a non-literal LIKE).
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`) WHERE a.x >= 1 AND a.y <> 'z' OR NOT a.x IN [3] RETURN a.x"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) WHERE a.y STARTS WITH 'a' RETURN a.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) WHERE b.z > 1.0 AND r.alias IS NULL RETURN a.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) WHERE a.nope = 1 RETURN a.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) WHERE a.y STARTS WITH a.x RETURN a.y"
+
 	rm -f "$db"
 fi
 

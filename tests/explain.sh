@@ -55,13 +55,44 @@ expect 'MATCH (a:`ns:f`)<-[r:calls]-(b:`ns2:g`) RETURN b.id' \
 expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN r.alias' \
 	'SELECT r."alias" FROM "__provenance__" r WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"''
 
+# WHERE (M5): boolean expressions ANDed onto the pattern predicates.
+# Comparisons and AND (parenthesised).
+expect 'MATCH (a:`ns:f`) WHERE a.x >= 1 AND a.x < 5 RETURN a.x' \
+	'SELECT a."x" FROM "ns:f" a WHERE (a."x" >= 1 AND a."x" < 5)'
+# OR / NOT.
+expect 'MATCH (a:`ns:f`) WHERE a.x = 1 OR a.x = 2 RETURN a.x' \
+	'SELECT a."x" FROM "ns:f" a WHERE (a."x" = 1 OR a."x" = 2)'
+expect 'MATCH (a:`ns:f`) WHERE NOT a.x = 2 RETURN a.x' \
+	'SELECT a."x" FROM "ns:f" a WHERE (NOT a."x" = 2)'
+# IN and IS [NOT] NULL.
+expect 'MATCH (a:`ns:f`) WHERE a.x IN [1, 2, 3] RETURN a.x' \
+	'SELECT a."x" FROM "ns:f" a WHERE a."x" IN (1, 2, 3)'
+expect 'MATCH (a:`ns:f`) WHERE a.y IS NOT NULL RETURN a.y' \
+	'SELECT a."y" FROM "ns:f" a WHERE a."y" IS NOT NULL'
+# STARTS WITH / CONTAINS -> LIKE with a backslash escape; metacharacters in the
+# literal are escaped so only the added wildcards match.
+expect 'MATCH (a:`ns:f`) WHERE a.y STARTS WITH "a" RETURN a.y' \
+	'SELECT a."y" FROM "ns:f" a WHERE a."y" LIKE '"'"'a%'"'"' ESCAPE '"'"'\'"'"''
+expect 'MATCH (a:`ns:f`) WHERE a.y CONTAINS "a_b" RETURN a.y' \
+	'SELECT a."y" FROM "ns:f" a WHERE a."y" LIKE '"'"'%a\_b%'"'"' ESCAPE '"'"'\'"'"''
+# A WHERE reference to a node forces that node's table to be joined in, even when
+# only another entity is returned.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE r.alias IS NULL RETURN a.id' \
+	'SELECT a."id" FROM "__provenance__" r JOIN "ns:f" a ON a."id" = r."source_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' AND r."alias" IS NULL'
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE b.z > 1 RETURN a.id' \
+	'SELECT a."id" FROM "__provenance__" r JOIN "ns:f" a ON a."id" = r."source_id" JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' AND b."z" > 1'
+
+# WHERE resolution/scope errors.
+reject 'MATCH (a:`ns:f`) WHERE a.nope = 1 RETURN a.id'         # unknown column
+reject 'MATCH (a:`ns:f`) WHERE a.y STARTS WITH a.x RETURN a.y' # needs a literal
+reject 'MATCH (a:`ns:f`) WHERE count(a.x) > 1 RETURN a.x'      # func (M7)
+
 # Resolution errors.
 reject 'MATCH (a:`ns:f`) RETURN a.nope'      # unknown column
 reject 'MATCH (a:`nope:x`) RETURN a.id'      # unknown table
 reject 'MATCH (a) RETURN a.x'                # node has no label
 
 # Not-yet-supported constructs must be rejected, not mistranslated.
-reject 'MATCH (a) WHERE a.x = 1 RETURN a.x'  # WHERE (M5)
 reject 'MATCH (a:`ns:f`)--(b:`ns2:g`) RETURN a.id'   # undirected (M6)
 reject 'MATCH (a)-[:calls*1..3]->(b) RETURN b.id'    # var-length (M8)
 reject 'MATCH (a:`ns:f`) RETURN a'           # whole-node RETURN (M9)
