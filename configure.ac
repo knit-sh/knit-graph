@@ -2,7 +2,9 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.71])
-AC_INIT([knit-graph],[0.1.0],[https://example.invalid/knit-graph])
+# The version is kept in the top-level VERSION file and read here at autoreconf
+# time (m4_esyscmd_s strips the trailing newline).
+AC_INIT([knit-graph],[m4_esyscmd_s([cat VERSION])],[https://github.com/knit-sh/knit-graph])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([src/main.c])
