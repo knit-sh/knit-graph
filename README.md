@@ -1,5 +1,9 @@
 # knit-graph
 
+[![CI](https://github.com/knit-sh/knit-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/knit-sh/knit-graph/actions/workflows/ci.yml)
+[![Code coverage](https://github.com/knit-sh/knit-graph/actions/workflows/coverage.yml/badge.svg)](https://github.com/knit-sh/knit-graph/actions/workflows/coverage.yml)
+[![codecov](https://codecov.io/gh/knit-sh/knit-graph/branch/main/graph/badge.svg)](https://codecov.io/gh/knit-sh/knit-graph)
+
 A standalone C program that accepts a read-only [Cypher](https://opencypher.org/) statement,
 translates it to SQL, and runs it against a SQLite **provenance** database from the Knit framework — so graph-shaped
 questions can be asked in graph syntax while all storage and execution stay in SQLite.
