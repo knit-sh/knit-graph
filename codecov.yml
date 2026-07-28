@@ -2,7 +2,9 @@
 #
 # Coverage is collected by the "Code coverage" GitHub Actions workflow
 # (.github/workflows/coverage.yml): it builds with --enable-coverage, runs the
-# test suite, then codecov/codecov-action runs gcov and uploads the result here.
+# test suite, generates an lcov report with coverage.sh, and uploads that .info
+# file via codecov/codecov-action. The generated bison/flex sources are already
+# excluded in the .info; the ignore list below is a redundant safety net.
 
 coverage:
   status:

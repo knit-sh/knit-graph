@@ -145,13 +145,15 @@ Configure with `--enable-coverage` to build instrumented objects:
 mkdir build && cd build && ../configure --enable-coverage && make && make check
 ```
 
-In CI, the [Code coverage workflow](.github/workflows/coverage.yml) then uploads the result to
-[Codecov](https://codecov.io); the generated bison/flex sources are excluded via
-[`codecov.yml`](codecov.yml), and the project/patch targets are enforced there.
+In CI, the [Code coverage workflow](.github/workflows/coverage.yml) runs `coverage.sh` to produce an
+`lcov` report and uploads that `.info` file to [Codecov](https://codecov.io) (rather than relying on
+Codecov's own gcov discovery, which does not handle this out-of-tree autotools build). The generated
+bison/flex sources are excluded from the report; [`codecov.yml`](codecov.yml) keeps a redundant
+exclusion and enforces the project/patch targets there.
 
-For a quick local report without Codecov, `coverage.sh` captures line coverage with `lcov`, applies
-the same exclusions, prints a summary, writes a browsable report to `BUILDDIR/coverage-html/` (when
-`genhtml` is present), and fails below a threshold:
+The same `coverage.sh` gives a quick local report without Codecov: it captures line coverage with
+`lcov`, applies those exclusions, prints a summary, writes a browsable report to
+`BUILDDIR/coverage-html/` (when `genhtml` is present), and fails below a threshold:
 
 ```sh
 ./coverage.sh build 80                 # BUILDDIR THRESHOLD%

@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential autoconf automake \
-            bison flex libsqlite3-dev sqlite3 valgrind
+            bison flex libsqlite3-dev sqlite3 valgrind lcov
 
       - name: Build (coverage instrumented) and run the test suite
         run: |
@@ -29,10 +29,21 @@ jobs:
           make
           make check
 
-      # codecov-action runs gcov over the .gcda data and uploads the report.
-      # Generated bison/flex sources are excluded via the root codecov.yml.
+      # Produce an lcov report ourselves rather than relying on codecov's gcov
+      # auto-discovery, which fails on this out-of-tree autotools build (empty /
+      # unmappable reports -> "error processing the coverage reports", 0%).
+      # coverage.sh captures build/src, excludes the generated bison/flex sources
+      # and /usr, and writes build/coverage.filtered.info. Threshold 0 => the gate
+      # lives on Codecov (codecov.yml), not here.
+      - name: Generate lcov report
+        run: sh coverage.sh build 0
+
+      # Upload only that file; disable_search stops the action from also scanning
+      # for (and choking on) the raw gcov data.
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          files: build/coverage.filtered.info
+          disable_search: true
           fail_ci_if_error: true
           verbose: true
