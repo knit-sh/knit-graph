@@ -103,6 +103,17 @@ expect 'MATCH (a:`ns:f`)-[:chain*]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id ORD
 # A var-length hop composes with aggregation: two nodes reachable within 2 hops.
 expect 'MATCH (a:`ns:f`)-[:chain*1..2]->(b:`ns:f`) WHERE a.id = "f1" RETURN count(*) AS reachable' 'reachable\n2\n'
 
+# Whole node / relationship in RETURN (M9): a bare variable renders as a JSON
+# object of the entity's columns, keyed by column name, in schema order.
+expect 'MATCH (a:`ns:f`) RETURN a' \
+	'a\n{"id":"f1","x":1,"y":"a"}\n{"id":"f2","x":2,"y":"b"}\n'
+# A whole relationship: the edge row, with the NULL alias rendered as JSON null.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN r' \
+	'r\n{"source_id":"f1","source_name":"ns:f","target_id":"g1","target_name":"ns2:g","edge_type":"calls","start_time":0.0,"end_time":1.0,"alias":null}\n'
+# A whole node alongside a scalar: b expands to JSON, a.id stays a plain field.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN a.id, b' \
+	'id|b\nf1|{"id":"g1","z":1.5}\n'
+
 # Errors still propagate on the execution path (unknown column, write clause,
 # unknown column inside WHERE).
 reject 'MATCH (a:`ns:f`) RETURN a.nope'

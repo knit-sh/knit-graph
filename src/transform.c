@@ -51,7 +51,12 @@
  * predicates and the whole RETURN tail above are reused unchanged. It is
  * supported as a single directed hop (like the undirected case).
  *
- * RETURN of a whole entity is rejected here; that arrives in a later milestone.
+ * A whole entity in RETURN (M9) -- `RETURN a` for a node or `RETURN r` for a
+ * relationship -- expands to a json_object() over that entity's catalog columns,
+ * in schema order, aliased to the variable name. A node's table is joined in
+ * (like any column reference); a relationship maps to the edge table already in
+ * the FROM. It works uniformly across the general, undirected and (for nodes)
+ * variable-length engines, since all share the SELECT/RETURN machinery.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -245,6 +250,42 @@ static int emit_agg(SqlBuf *b, const Expr *e, const Catalog *cat,
 	return 0;
 }
 
+/*
+ * Emit a whole-entity reference (RETURN a / RETURN r) as a json_object over the
+ * entity's catalog columns in schema order: json_object('c', var."c", ...). A
+ * node needs a label to know its table and is marked referenced so its table is
+ * joined in; a relationship maps to the edge table, already in the FROM. The
+ * variable is also the SQL alias (a whole entity always has a variable).
+ */
+static int emit_entity(SqlBuf *b, const char *var, const Catalog *cat,
+                      Bind *binds, int nb, Slot *slots, char **errmsg)
+{
+	Bind *bd = find_bind(binds, nb, var);
+	if (!bd)
+		return fail(errmsg, "unknown variable: %s", var);
+	if (!bd->table)
+		return fail(errmsg,
+			"cannot resolve columns of '%s': it has no label", var);
+
+	const CatalogTable *t = catalog_find_table(cat, bd->table);
+	if (!t)
+		return fail(errmsg, "unknown table: %s", bd->table);
+
+	if (bd->is_node)
+		slots[bd->slot].referenced = 1;
+
+	sqlbuf_append(b, "json_object(");
+	for (int i = 0; i < t->ncolumns; i++) {
+		if (i)
+			sqlbuf_append(b, ", ");
+		append_string(b, t->columns[i]);
+		sqlbuf_append(b, ", ");
+		append_column(b, var, t->columns[i]);
+	}
+	sqlbuf_append_char(b, ')');
+	return 0;
+}
+
 /* A RETURN item is an aggregate when its expression is an aggregate call. */
 static int item_is_aggregate(const ReturnItem *it)
 {
@@ -258,11 +299,13 @@ static int emit_return_expr(SqlBuf *b, const Expr *e, const Catalog *cat,
 	if (e->kind == EXPR_PROPERTY)
 		return emit_property(b, e->var, e->key, cat, binds, nb, slots,
 			errmsg);
+	if (e->kind == EXPR_VARIABLE)
+		return emit_entity(b, e->var, cat, binds, nb, slots, errmsg);
 	if (e->kind == EXPR_FUNC)
 		return emit_agg(b, e, cat, binds, nb, slots, errmsg);
 	return fail(errmsg,
-		"only property references (e.g. a.x) and aggregate functions "
-		"are supported in RETURN yet");
+		"only property references (e.g. a.x), whole entities (e.g. a) "
+		"and aggregate functions are supported in RETURN yet");
 }
 
 /* Does the RETURN list define `alias` (for an ORDER BY reference to it)? */
@@ -283,10 +326,12 @@ static int check_return_shape(const Return *r, char **errmsg)
 
 	for (ReturnItem *it = r->items; it; it = it->next) {
 		if (it->expr->kind != EXPR_PROPERTY
+				&& it->expr->kind != EXPR_VARIABLE
 				&& it->expr->kind != EXPR_FUNC)
 			return fail(errmsg,
-				"only property references (e.g. a.x) and aggregate "
-				"functions are supported in RETURN yet");
+				"only property references (e.g. a.x), whole entities "
+				"(e.g. a) and aggregate functions are supported in "
+				"RETURN yet");
 	}
 	if (r->skip && !(r->skip->kind == EXPR_LITERAL
 			&& r->skip->lit_kind == LIT_INT))
@@ -327,9 +372,15 @@ static int emit_select(SqlBuf *sql, const Return *r, const Catalog *cat,
 				errmsg))
 			return 1;
 
-		if (it->alias) {
+		/* A whole entity is aliased to its variable name (so the JSON
+		 * column's header is `a`, not the json_object(...) text) unless
+		 * the query gives an explicit alias. */
+		const char *alias = it->alias;
+		if (!alias && it->expr->kind == EXPR_VARIABLE)
+			alias = it->expr->var;
+		if (alias) {
 			sqlbuf_append(sql, " AS ");
-			append_ident(sql, it->alias);
+			append_ident(sql, alias);
 		}
 	}
 	return 0;

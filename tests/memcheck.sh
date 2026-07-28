@@ -108,6 +108,14 @@ if make_fixture "$db"; then
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls*1..2]-(b:\`ns:f\`) RETURN b.id"
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls*1..2]->(b:\`ns2:g\`)-[:wraps]->(c) RETURN b.id"
 
+	# Whole node / relationship in RETURN (M9): the json_object expansion on
+	# the translation and execution paths, plus an error path (unknown var).
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`) RETURN a"
+	run $VG "$KG" --explain "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN r"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN a"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN a.id, b"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN b"
+
 	rm -f "$db"
 fi
 

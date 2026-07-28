@@ -159,6 +159,29 @@ expecth 'MATCH (a:`ns:f`)-[:chain*..2]->(b:`ns:f`) WHERE a.id = "f1" RETURN b.id
 WITH RECURSIVE "walk"(source_id, source_name, target_id, target_name, depth, path) AS (SELECT e."source_id", e."source_name", e."target_id", e."target_name", 1, '/' || e.rowid || '/' FROM "__provenance__" e WHERE e."edge_type" = 'chain' UNION ALL SELECT w."source_id", w."source_name", e."target_id", e."target_name", w."depth" + 1, w."path" || e.rowid || '/' FROM "walk" w JOIN "__provenance__" e ON e."source_id" = w."target_id" AND e."source_name" = w."target_name" WHERE e."edge_type" = 'chain' AND w."depth" < 2 AND w."path" NOT LIKE '%/' || e.rowid || '/%') SELECT b."id" FROM "walk" r JOIN "ns:f" a ON a."id" = r."source_id" JOIN "ns:f" b ON b."id" = r."target_id" WHERE r."source_name" = 'ns:f' AND r."target_name" = 'ns:f' AND a."id" = 'f1' ORDER BY b."id"
 EOF
 
+# Whole node / relationship in RETURN (M9): a bare variable expands to a
+# json_object over the entity's catalog columns (schema order), aliased to the
+# variable name. A node's table is joined in; a relationship is the edge already
+# in the FROM.
+expecth 'MATCH (a:`ns:f`) RETURN a' <<'EOF'
+SELECT json_object('id', a."id", 'x', a."x", 'y', a."y") AS "a" FROM "ns:f" a
+EOF
+expecth 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN r' <<'EOF'
+SELECT json_object('source_id', r."source_id", 'source_name', r."source_name", 'target_id', r."target_id", 'target_name', r."target_name", 'edge_type', r."edge_type", 'start_time', r."start_time", 'end_time', r."end_time", 'alias', r."alias") AS "r" FROM "__provenance__" r WHERE r."edge_type" = 'calls' AND r."source_name" = 'ns:f' AND r."target_name" = 'ns2:g'
+EOF
+# A whole node alongside a property: the entity pulls its table in like any ref.
+expecth 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN a.id, b' <<'EOF'
+SELECT a."id", json_object('id', b."id", 'z', b."z") AS "b" FROM "__provenance__" r JOIN "ns:f" a ON a."id" = r."source_id" JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = 'calls' AND r."source_name" = 'ns:f' AND r."target_name" = 'ns2:g'
+EOF
+# An explicit alias overrides the variable-name default.
+expecth 'MATCH (a:`ns:f`) RETURN a AS node' <<'EOF'
+SELECT json_object('id', a."id", 'x', a."x", 'y', a."y") AS "node" FROM "ns:f" a
+EOF
+
+# M9 errors.
+reject 'MATCH (a) RETURN a'                    # whole node without a label
+reject 'MATCH (a:`ns:f`) RETURN b'             # unknown variable
+
 # M8 errors.
 reject 'MATCH (a:`ns:f`)-[:calls*0..2]->(b:`ns:f`) RETURN b.id'          # lower bound < 1
 reject 'MATCH (a:`ns:f`)-[:calls*3..2]->(b:`ns:f`) RETURN b.id'          # lower > upper
@@ -184,9 +207,6 @@ reject 'MATCH (a:`ns:f`) WHERE count(a.x) > 1 RETURN a.x'      # aggregate not v
 reject 'MATCH (a:`ns:f`) RETURN a.nope'      # unknown column
 reject 'MATCH (a:`nope:x`) RETURN a.id'      # unknown table
 reject 'MATCH (a) RETURN a.x'                # node has no label
-
-# Not-yet-supported constructs must be rejected, not mistranslated.
-reject 'MATCH (a:`ns:f`) RETURN a'           # whole-node RETURN (M9)
 
 rm -f "$db"
 exit $fail
