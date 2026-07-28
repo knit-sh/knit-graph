@@ -1,0 +1,80 @@
+name: Release
+
+# When a VERSION bump lands on main, validate it and cut a tagged release whose
+# asset is the `make dist` tarball.
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'VERSION' ]
+
+# Needed to push the tag and create the GitHub release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # need every tag to find the previous version
+          fetch-tags: true
+
+      - name: Validate the version and compare with the previous release
+        run: |
+          set -eu
+          new=$(tr -d '[:space:]' < VERSION)
+
+          # 1. Format must be X.Y.Z (plain integers).
+          if ! printf '%s' "$new" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION '$new' is not a valid X.Y.Z version"
+            exit 1
+          fi
+
+          # 2. Must be strictly higher than the latest vX.Y.Z tag (if any).
+          prev_tag=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+          prev=${prev_tag#v}
+          if [ -z "$prev" ]; then
+            echo "No previous version tag; $new is the first release."
+          elif [ "$new" = "$prev" ]; then
+            echo "::error::VERSION $new equals the latest release v$prev"
+            exit 1
+          else
+            highest=$(printf '%s\n%s\n' "$new" "$prev" | sort -V | tail -n1)
+            if [ "$highest" != "$new" ]; then
+              echo "::error::VERSION $new is not higher than the latest release v$prev"
+              exit 1
+            fi
+            echo "Bumping v$prev -> v$new"
+          fi
+
+          echo "VERSION_NEW=$new" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake bison flex libsqlite3-dev
+
+      - name: Build the distribution tarball
+        run: |
+          set -eu
+          autoreconf -i
+          mkdir build && cd build
+          ../configure
+          make
+          make dist
+          # Surface the artifact path for the release step.
+          echo "TARBALL=build/knit-graph-${VERSION_NEW}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Create the tag and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          test -f "$TARBALL" || { echo "::error::tarball $TARBALL not found"; exit 1; }
+          gh release create "v${VERSION_NEW}" "$TARBALL" \
+            --title "knit-graph v${VERSION_NEW}" \
+            --target "$GITHUB_SHA" \
+            --generate-notes
