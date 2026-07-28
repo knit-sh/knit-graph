@@ -116,6 +116,21 @@ if make_fixture "$db"; then
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN a.id, b"
 	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`) RETURN b"
 
+	# Output modes (M10): exercise the buffered result set and each renderer
+	# family -- separated, csv, html, json, line, and the columnar/box path --
+	# plus an empty result (the buffer's early-return path).
+	run $VG "$KG" -json "$db" "MATCH (a:\`ns:f\`) RETURN a"
+	run $VG "$KG" -box "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.x, a.y"
+	run $VG "$KG" -table -noheader "$db" "MATCH (a:\`ns:f\`) RETURN a.id"
+	run $VG "$KG" -markdown "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.x"
+	run $VG "$KG" -column "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.x"
+	run $VG "$KG" -csv "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.y"
+	run $VG "$KG" -html "$db" "MATCH (a:\`ns:f\`) RETURN a.y"
+	run $VG "$KG" -line "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.x"
+	run $VG "$KG" -ascii -noheader "$db" "MATCH (a:\`ns:f\`) RETURN a.id"
+	run $VG "$KG" -separator ';' -newline '#' "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.x"
+	run $VG "$KG" -json "$db" "MATCH (a:\`ns:f\`)<-[r:calls]-(b:\`ns2:g\`) RETURN b.id"
+
 	rm -f "$db"
 fi
 

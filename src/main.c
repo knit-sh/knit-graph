@@ -2,9 +2,11 @@
  * knit-graph -- translate a read-only Cypher statement into SQL and run it
  * against a SQLite provenance database.
  *
- * Current state (M4): the plain DBFILE + query path runs end to end -- parse,
- * translate to SQL against the schema catalog, execute, and print the result in
- * sqlite3's default "-list" format (pipe-separated, with a header row).
+ * The plain DBFILE + query path runs end to end -- parse, translate to SQL
+ * against the schema catalog, execute, and render the result set in any of the
+ * sqlite3 CLI output modes (default "-list"), selected by the same flags the
+ * sqlite3 shell uses (-json, -box, -csv, ..., -header/-noheader, -separator,
+ * -newline).
  * `--ast` parses a statement and prints its syntax tree (no database needed).
  * `--catalog` introspects a database and lists its tables and columns, or
  * validates a single table / table.column reference. `--explain` translates a
@@ -31,7 +33,7 @@ static const char *PROG = "knit-graph";
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"Usage: %s [--ast] DBFILE 'CYPHER'\n"
+		"Usage: %s [OUTPUT-OPTIONS] DBFILE 'CYPHER'\n"
 		"       %s --ast 'CYPHER'\n"
 		"       %s --explain DBFILE 'CYPHER'\n"
 		"       %s --catalog DBFILE [TABLE[.COLUMN]]\n"
@@ -39,13 +41,62 @@ static void usage(FILE *out)
 		"Translate a read-only Cypher statement into SQL and run it against the\n"
 		"SQLite provenance database DBFILE (opened read-only).\n"
 		"\n"
-		"Options:\n"
+		"Modes:\n"
 		"  --ast         parse only and print the syntax tree (no database)\n"
 		"  --explain     translate to SQL and print it, without executing\n"
 		"  --catalog     list the database's tables and columns; with a TABLE or\n"
 		"                TABLE.COLUMN argument, validate that reference\n"
-		"  -h, --help    show this help and exit\n",
+		"  -h, --help    show this help and exit\n"
+		"\n"
+		"Output options (mirroring the sqlite3 CLI; default is -list):\n"
+		"  -ascii -box -column -csv -html -json -line -list -markdown -table -tabs\n"
+		"  -header / -noheader   show or hide the column-name header\n"
+		"  -separator SEP        column separator (list/csv/tabs/ascii modes)\n"
+		"  -newline SEP          row separator     (list/csv/tabs/ascii modes)\n",
 		PROG, PROG, PROG, PROG);
+}
+
+/*
+ * If arg is an output flag, apply it to o and return 1. Following the sqlite3
+ * shell, a mode flag only resets the separators it owns (csv/tabs the column
+ * separator, ascii both; list touches neither), so a later -separator/-newline
+ * always wins. -separator/-newline consume the following argv element, so *pi
+ * is advanced past it; a missing value sets *want_value and returns 1 so the
+ * caller can report it.
+ */
+static int output_flag(OutputOptions *o, char **argv, int argc, int *pi,
+		       int *want_value)
+{
+	const char *a = argv[*pi];
+
+	if (strcmp(a, "-list") == 0)          o->mode = OUT_LIST;
+	else if (strcmp(a, "-csv") == 0)      { o->mode = OUT_CSV; o->colsep = ","; }
+	else if (strcmp(a, "-tabs") == 0)     { o->mode = OUT_TABS; o->colsep = "\t"; }
+	else if (strcmp(a, "-ascii") == 0)    { o->mode = OUT_ASCII;
+						o->colsep = "\x1f"; o->rowsep = "\x1e"; }
+	else if (strcmp(a, "-html") == 0)     o->mode = OUT_HTML;
+	else if (strcmp(a, "-json") == 0)     o->mode = OUT_JSON;
+	else if (strcmp(a, "-line") == 0)     o->mode = OUT_LINE;
+	else if (strcmp(a, "-column") == 0)   o->mode = OUT_COLUMN;
+	else if (strcmp(a, "-table") == 0)    o->mode = OUT_TABLE;
+	else if (strcmp(a, "-box") == 0)      o->mode = OUT_BOX;
+	else if (strcmp(a, "-markdown") == 0) o->mode = OUT_MARKDOWN;
+	else if (strcmp(a, "-header") == 0)   o->header = 1;
+	else if (strcmp(a, "-noheader") == 0) o->header = 0;
+	else if (strcmp(a, "-separator") == 0 || strcmp(a, "-newline") == 0) {
+		if (*pi + 1 >= argc) {
+			*want_value = 1;
+			return 1;
+		}
+		const char *val = argv[++(*pi)];
+		if (a[1] == 's')
+			o->colsep = val;
+		else
+			o->rowsep = val;
+	} else {
+		return 0;
+	}
+	return 1;
 }
 
 /* Open DBFILE read-only, reporting failure to stderr. Returns NULL on error. */
@@ -198,7 +249,8 @@ static int run_explain(const char *dbfile, const char *query)
  * Default path: parse QUERY, translate it to SQL against DBFILE's schema,
  * execute it, and print the result set in "-list" format. Returns an exit code.
  */
-static int run_query(const char *dbfile, const char *query)
+static int run_query(const char *dbfile, const char *query,
+		     const OutputOptions *opts)
 {
 	sqlite3 *db = open_db_ro(dbfile);
 	if (!db)
@@ -225,7 +277,7 @@ static int run_query(const char *dbfile, const char *query)
 	if (transform_query(q, cat, &sql, &err) != 0) {
 		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot translate query");
 		status = 1;
-	} else if (exec_query(db, sql, &err) != 0) {
+	} else if (exec_query(db, sql, opts, &err) != 0) {
 		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot run query");
 		status = 1;
 	}
@@ -243,11 +295,13 @@ int main(int argc, char **argv)
 	int ast_mode = 0;
 	int explain_mode = 0;
 	int catalog_mode = 0;
+	OutputOptions opts = { OUT_LIST, 1, "|", "\n" };
 	const char *pos[2] = { NULL, NULL };
 	int npos = 0;
 	int i;
 
 	for (i = 1; i < argc; i++) {
+		int want_value = 0;
 		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
 			usage(stdout);
 			return 0;
@@ -257,6 +311,13 @@ int main(int argc, char **argv)
 			explain_mode = 1;
 		} else if (strcmp(argv[i], "--catalog") == 0) {
 			catalog_mode = 1;
+		} else if (output_flag(&opts, argv, argc, &i, &want_value)) {
+			if (want_value) {
+				fprintf(stderr, "%s: %s expects an argument\n",
+					PROG, argv[i]);
+				usage(stderr);
+				return 2;
+			}
 		} else if (npos < 2) {
 			pos[npos++] = argv[i];
 		} else {
@@ -317,5 +378,5 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	return run_query(pos[0], pos[1]);
+	return run_query(pos[0], pos[1], &opts);
 }

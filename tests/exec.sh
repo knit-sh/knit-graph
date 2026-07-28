@@ -49,8 +49,9 @@ expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN a.id, b.id' 'id|id\nf1|g1
 # A NULL field (alias is NULL in the fixture) renders as an empty field.
 expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) RETURN r.alias' 'alias\n\n'
 
-# Reversed direction matches nothing here: header only, no data rows.
-expect 'MATCH (a:`ns:f`)<-[r:calls]-(b:`ns2:g`) RETURN b.id' 'id\n'
+# Reversed direction matches nothing: like the sqlite3 shell, an empty result
+# prints nothing at all -- not even a header row.
+expect 'MATCH (a:`ns:f`)<-[r:calls]-(b:`ns2:g`) RETURN b.id' ''
 
 # WHERE (M5): filter the fixture rows.
 expect 'MATCH (a:`ns:f`) WHERE a.x = 2 RETURN a.x, a.y' 'x|y\n2|b\n'
@@ -60,8 +61,8 @@ expect 'MATCH (a:`ns:f`) WHERE a.x IN [1] RETURN a.id' 'id\nf1\n'
 expect 'MATCH (a:`ns:f`) WHERE a.y STARTS WITH "a" RETURN a.id' 'id\nf1\n'
 # A NULL relationship property tested with IS NULL still matches the edge.
 expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE r.alias IS NULL RETURN a.id, b.id' 'id|id\nf1|g1\n'
-# A WHERE reference to b joins it in; z=1.5 fails z>2.0, so no data rows.
-expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE b.z > 2.0 RETURN a.id' 'id\n'
+# A WHERE reference to b joins it in; z=1.5 fails z>2.0, so nothing is emitted.
+expect 'MATCH (a:`ns:f`)-[r:calls]->(b:`ns2:g`) WHERE b.z > 2.0 RETURN a.id' ''
 
 # Chains, undirected & multi-pattern (M6).
 # Two-hop chain f1 -calls-> g1 -wraps-> f2.
@@ -69,8 +70,8 @@ expect 'MATCH (a:`ns:f`)-[r1:calls]->(b:`ns2:g`)-[r2:wraps]->(c:`ns:f`) RETURN a
 # Undirected finds the calls edge regardless of the query's direction: the edge
 # is ns:f -> ns2:g, yet querying ns2:g--ns:f still matches it.
 expect 'MATCH (a:`ns2:g`)-[r:calls]-(b:`ns:f`) RETURN a.id, b.id' 'id|id\ng1|f1\n'
-# The directed form of the same query matches nothing (header only).
-expect 'MATCH (a:`ns2:g`)-[r:calls]->(b:`ns:f`) RETURN a.id, b.id' 'id|id\n'
+# The directed form of the same query matches nothing, so emits nothing.
+expect 'MATCH (a:`ns2:g`)-[r:calls]->(b:`ns:f`) RETURN a.id, b.id' ''
 # Comma-separated patterns cross-join: two ns:f rows x one ns2:g row.
 expect 'MATCH (a:`ns:f`), (b:`ns2:g`) RETURN a.id, b.id' 'id|id\nf1|g1\nf2|g1\n'
 

@@ -16,6 +16,7 @@ TESTS = \
 	catalog.sh \
 	explain.sh \
 	exec.sh \
+	output.sh \
 	memcheck.sh
 
 # Ship the tests and their fixtures in the distribution tarball.
@@ -27,6 +28,7 @@ EXTRA_DIST = \
 	catalog.sh \
 	explain.sh \
 	exec.sh \
+	output.sh \
 	memcheck.sh \
 	fixture.sh \
 	golden
