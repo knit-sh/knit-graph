@@ -1,0 +1,29 @@
+# Codecov configuration (https://docs.codecov.com/docs/codecov-yaml).
+#
+# Coverage is collected by the "Code coverage" GitHub Actions workflow
+# (.github/workflows/coverage.yml): it builds with --enable-coverage, runs the
+# test suite, then codecov/codecov-action runs gcov and uploads the result here.
+
+coverage:
+  status:
+    project:
+      default:
+        target: 80%      # hand-written code sits around 89%
+        threshold: 2%    # tolerate small fluctuations
+    patch:
+      default:
+        target: 80%      # new/changed lines must be reasonably covered
+
+# The bison/flex output is generated, not hand-written -- exclude it so the
+# figure reflects only our code. Both the compiled .c/.h and the .y/.l are listed
+# because gcov attributes lines to the .y/.l via #line directives.
+ignore:
+  - "src/cypher_parser.c"
+  - "src/cypher_parser.h"
+  - "src/cypher_parser.y"
+  - "src/cypher_scanner.c"
+  - "src/cypher_scanner.l"
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: false

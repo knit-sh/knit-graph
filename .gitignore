@@ -5,6 +5,9 @@
 *.la
 /src/knit-graph
 
+# Out-of-tree build directory (the project builds in ./build)
+/build/
+
 # Autotools generated files
 Makefile
 Makefile.in

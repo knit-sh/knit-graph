@@ -1,0 +1,38 @@
+name: Code coverage
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  codecov:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake \
+            bison flex libsqlite3-dev sqlite3 valgrind
+
+      - name: Build (coverage instrumented) and run the test suite
+        run: |
+          autoreconf -i
+          mkdir build
+          cd build
+          ../configure --enable-coverage
+          make
+          make check
+
+      # codecov-action runs gcov over the .gcda data and uploads the report.
+      # Generated bison/flex sources are excluded via the root codecov.yml.
+      - uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+          verbose: true
