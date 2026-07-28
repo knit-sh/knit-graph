@@ -1,7 +1,7 @@
 # knit-graph
 
 A standalone C program that accepts a read-only [Cypher](https://opencypher.org/) statement,
-translates it to SQL, and runs it against a SQLite **provenance** database — so graph-shaped
+translates it to SQL, and runs it against a SQLite **provenance** database from the Knit framework — so graph-shaped
 questions can be asked in graph syntax while all storage and execution stay in SQLite.
 
 - Design / specification: [specifications.md](specifications.md)
@@ -28,12 +28,13 @@ The database is always opened **read-only**; write Cypher clauses are rejected.
 
 ## Building
 
+## Building from git
+
 ```sh
-sudo apt-get install -y libsqlite3-dev   # provides sqlite3.h + libsqlite3
 autoreconf -i
-mkdir build && cd build                  # out-of-tree build
+mkdir build && cd build
 ../configure
-make                                     # do not pass -j
+make
 ```
 
 Build dependencies: gcc, autoconf, automake, bison, flex, and the sqlite3 C library. No libtool
@@ -47,16 +48,12 @@ A `make dist` tarball already contains the generated parser and scanner (`cypher
 autotools, bison, and flex are *not* required:
 
 ```sh
-sudo apt-get install -y libsqlite3-dev
 tar xzf knit-graph-0.1.0.tar.gz && cd knit-graph-0.1.0
 mkdir build && cd build
-../configure                             # succeeds even without bison/flex
-make                                     # uses the shipped generated sources
+../configure
+make
+make install
 ```
-
-`configure` does not fail when bison/flex are absent, and `make` never invokes them because the
-shipped generated sources are up to date. (If a rebuild were ever triggered without the tools
-present, the bundled `build-aux/missing` wrapper falls back to the shipped files with a warning.)
 
 ## Usage
 
@@ -96,18 +93,20 @@ nothing in every mode (matching the sqlite3 shell).
 ### Examples
 
 ```sh
-# The five most-called targets, as JSON.
+# The five most-called ns2:g targets, as JSON.
 knit-graph -json prov.db \
-  "MATCH (a:\`ns:f\`)-[:calls]->(b) RETURN b.id, count(*) AS n ORDER BY n DESC LIMIT 5"
+  "MATCH (a:\`ns:f\`)-[:calls]->(b:\`ns2:g\`) RETURN b.id, count(*) AS n ORDER BY n DESC LIMIT 5"
 
 # A whole node expands to a JSON object over its columns.
 knit-graph prov.db "MATCH (a:\`ns:f\`) RETURN a"
 
 # See the generated SQL without touching the database.
-knit-graph --explain prov.db "MATCH (a:\`ns:f\`)-[:calls*1..3]->(b) RETURN b.id"
+knit-graph --explain prov.db "MATCH (a:\`ns:f\`)-[:calls*1..3]->(b:\`ns2:g\`) RETURN b.id"
 ```
 
 ## Supported Cypher (read subset)
+
+knit-graph is specifically designed for the needs of the Knit framework, hence it only implements a subset of Cypher that it needs (namely, read operations).
 
 - `MATCH` / `WHERE` / `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`
 - Patterns: single node, relationship with direction (`->`, `<-`) or undirected (`--`), multi-hop
