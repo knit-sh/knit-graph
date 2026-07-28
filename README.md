@@ -100,6 +100,10 @@ knit-graph -json prov.db \
 # A whole node expands to a JSON object over its columns.
 knit-graph prov.db "MATCH (a:\`ns:f\`) RETURN a"
 
+# Untyped edge (-->): match a relationship of ANY type. The generated SQL simply
+# omits the edge_type filter (compare with the -[:calls]-> example above).
+knit-graph prov.db "MATCH (a:\`ns:f\`)-->(b:\`ns2:g\`) RETURN b.id, count(*) AS n ORDER BY n DESC LIMIT 5"
+
 # See the generated SQL without touching the database.
 knit-graph --explain prov.db "MATCH (a:\`ns:f\`)-[:calls*1..3]->(b:\`ns2:g\`) RETURN b.id"
 ```
@@ -111,7 +115,8 @@ knit-graph is specifically designed for the needs of the Knit framework, hence i
 - `MATCH` / `WHERE` / `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`
 - Patterns: single node, relationship with direction (`->`, `<-`) or undirected (`--`), multi-hop
   chains, comma-separated patterns, and variable-length paths (`-[:calls*1..3]->`, `*`, `*m..`),
-  compiled to a recursive CTE
+  compiled to a recursive CTE. The relationship type is optional — `-->` (or `-[r]->`) matches an
+  edge of any type, dropping the `edge_type` filter from the generated SQL
 - `WHERE`: `= <> < > <= >=`, `AND` / `OR` / `NOT`, `IN […]`, `IS [NOT] NULL`,
   `STARTS WITH` / `ENDS WITH` / `CONTAINS` (→ `LIKE`)
 - Aggregation: `count`, `collect` (→ `json_group_array`), `sum`, `avg`, `min`, `max`, with implicit

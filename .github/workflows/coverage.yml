@@ -31,7 +31,7 @@ jobs:
 
       # codecov-action runs gcov over the .gcda data and uploads the report.
       # Generated bison/flex sources are excluded via the root codecov.yml.
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
