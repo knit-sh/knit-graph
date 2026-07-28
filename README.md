@@ -37,7 +37,26 @@ make                                     # do not pass -j
 ```
 
 Build dependencies: gcc, autoconf, automake, bison, flex, and the sqlite3 C library. No libtool
-(knit-graph is a standalone binary).
+(knit-graph is a standalone binary). These apply to the **git checkout**, where the parser/scanner
+are regenerated from `cypher_parser.y` / `cypher_scanner.l`.
+
+### Building from a release tarball
+
+A `make dist` tarball already contains the generated parser and scanner (`cypher_parser.c`,
+`cypher_parser.h`, `cypher_scanner.c`), so building it needs **only gcc and `libsqlite3-dev`** —
+autotools, bison, and flex are *not* required:
+
+```sh
+sudo apt-get install -y libsqlite3-dev
+tar xzf knit-graph-0.1.0.tar.gz && cd knit-graph-0.1.0
+mkdir build && cd build
+../configure                             # succeeds even without bison/flex
+make                                     # uses the shipped generated sources
+```
+
+`configure` does not fail when bison/flex are absent, and `make` never invokes them because the
+shipped generated sources are up to date. (If a rebuild were ever triggered without the tools
+present, the bundled `build-aux/missing` wrapper falls back to the shipped files with a warning.)
 
 ## Usage
 
