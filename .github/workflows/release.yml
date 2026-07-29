@@ -75,6 +75,6 @@ jobs:
           set -eu
           test -f "$TARBALL" || { echo "::error::tarball $TARBALL not found"; exit 1; }
           gh release create "v${VERSION_NEW}" "$TARBALL" \
-            --title "knit-graph v${VERSION_NEW}" \
+            --title "Version ${VERSION_NEW}" \
             --target "$GITHUB_SHA" \
             --generate-notes
