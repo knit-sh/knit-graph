@@ -8,9 +8,6 @@ A standalone C program that accepts a read-only [Cypher](https://opencypher.org/
 translates it to SQL, and runs it against a SQLite **provenance** database from the Knit framework — so graph-shaped
 questions can be asked in graph syntax while all storage and execution stay in SQLite.
 
-- Design / specification: [specifications.md](specifications.md)
-- Milestones: [milestones.md](milestones.md)
-
 knit-graph is inspired by [graphqlite](https://github.com/dpapathanasiou/graphqlite) (MIT): it
 reuses the ideas — a Cypher→SQL transpiler pipeline, backtick-quoted labels, an `--explain` mode —
 but is an independent implementation with its own compact parser and a transformer specialised to the
