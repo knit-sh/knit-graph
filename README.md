@@ -59,6 +59,21 @@ make
 make install
 ```
 
+### Building against a non-default SQLite
+
+By default the build uses the SQLite header and library on the compiler's search
+paths (a system-wide `libsqlite3-dev`). To build against a SQLite installed under
+a custom prefix instead, pass `--with-sqlite3=DIR`:
+
+```sh
+../configure --with-sqlite3=/opt/sqlite
+```
+
+This adds `DIR/include` to the header search path and `DIR/lib` to the library
+search path, and records an rpath to `DIR/lib` so the resulting binary finds a
+shared `libsqlite3` there at runtime. Knit uses this to build knit-graph against
+its own private SQLite (`.knit/sqlite`).
+
 ## Usage
 
 ```
