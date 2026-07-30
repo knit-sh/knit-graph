@@ -131,6 +131,23 @@ if make_fixture "$db"; then
 	run $VG "$KG" -separator ';' -newline '#' "$db" "MATCH (a:\`ns:f\`) RETURN a.id, a.x"
 	run $VG "$KG" -json "$db" "MATCH (a:\`ns:f\`)<-[r:calls]-(b:\`ns2:g\`) RETURN b.id"
 
+	# Name map (M3): --names/--names-file/--derive-table-names and inline
+	# relationship property maps, on success and on the error paths (ambiguous
+	# label, invalid spec, missing file, bad edge column), so names.c's
+	# allocations and the transformer's inline-prop path are leak-checked.
+	printf 'ns:f=fnode\n' > vg_map.txt
+	run $VG "$KG" --names 'ns:f=fnode' "$db" "MATCH (a:fnode) RETURN a.x"
+	run $VG "$KG" --names-file vg_map.txt --explain "$db" "MATCH (a:\`ns:f\`) RETURN a.x"
+	run $VG "$KG" --derive-table-names "$db" "MATCH (a:\`ns:f\`)-[r:calls]->(b:\`ns2:g\`) RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[:calls {alias:'fast'}]->(b:\`ns2:g\`) RETURN b.id"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[{alias:'fast'}]-(b:\`ns2:g\`) RETURN b.id"
+	run $VG "$KG" --names 'ns:f=fnode
+x=ns:f' "$db" "MATCH (a:\`ns:f\`) RETURN a.x"
+	run $VG "$KG" --names 'no-equals' "$db" "MATCH (a:\`ns:f\`) RETURN a.x"
+	run $VG "$KG" --names-file no_such_file "$db" "MATCH (a:\`ns:f\`) RETURN a.x"
+	run $VG "$KG" "$db" "MATCH (a:\`ns:f\`)-[{nope:'x'}]->(b:\`ns2:g\`) RETURN b.id"
+	rm -f vg_map.txt
+
 	rm -f "$db"
 fi
 

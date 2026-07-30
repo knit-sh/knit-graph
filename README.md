@@ -62,9 +62,9 @@ make install
 ## Usage
 
 ```
-knit-graph [OUTPUT-OPTIONS] DBFILE 'CYPHER'
+knit-graph [OUTPUT-OPTIONS] [NAME-OPTIONS] DBFILE 'CYPHER'
 knit-graph --ast 'CYPHER'
-knit-graph --explain DBFILE 'CYPHER'
+knit-graph [NAME-OPTIONS] --explain DBFILE 'CYPHER'
 knit-graph --catalog DBFILE [TABLE[.COLUMN]]
 ```
 
@@ -93,6 +93,28 @@ Each mode reproduces the sqlite3 shell's formatting byte-for-byte for the equiva
 suite pins this by diffing against the installed `sqlite3` (see below). Two intentional differences:
 the header is **on** by default (the sqlite3 CLI defaults to off), and an empty result set prints
 nothing in every mode (matching the sqlite3 shell).
+
+### Label resolution (name map)
+
+A Cypher node label serves two purposes against the provenance schema: it names the table to JOIN
+and it supplies the value a `source_name`/`target_name` edge filter matches. knit-graph assumes both
+equal the label, which holds for a plain function table. But a Knit *override* command records its
+command name in `*_name` while its rows live in a differently named table (e.g. the `submit` command
+writes `jobs`). A **name map** bridges the two — each entry pairs a table name with the recorded name
+its edges carry — and is read both ways, so a label may be written as either spelling:
+
+```
+--names SPEC          map entries `table=name`, separated by newlines or `;`
+--names-file FILE      read the same map from FILE
+--derive-table-names   with no map, derive it from the data (uuid-exact)
+```
+
+With a map of `jobs=submit`, both `(:jobs)` and `(:submit)` resolve to a JOIN on `jobs` filtered by
+`*_name = 'submit'`. A label that is a table name for one command and a command name for a *different*
+command is genuinely ambiguous and is reported as an error rather than guessed. A label absent from
+the map (or when no map is given) resolves to itself, so the default behaviour is unchanged. The map
+options apply to the default run and `--explain`; `knit query` in Knit builds this map live from the
+experiment's registered commands and passes it on every invocation.
 
 ### Examples
 
@@ -126,6 +148,9 @@ knit-graph is specifically designed for the needs of the Knit framework, hence i
 - Aggregation: `count`, `collect` (→ `json_group_array`), `sum`, `avg`, `min`, `max`, with implicit
   `GROUP BY` on the non-aggregated `RETURN` items
 - `RETURN a` / `RETURN r` expand a whole node/relationship to a `json_object(...)` of its columns
+- Inline relationship property maps: `-[{alias:'fast'}]->` lowers to the same `edge.alias = 'fast'`
+  predicate as the `WHERE` form (each key must be an edge column and each value a literal). Supported
+  on directed and undirected single hops; not on variable-length relationships
 
 Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`, `LOAD CSV`, …) are rejected
 with a clear error and a nonzero exit.

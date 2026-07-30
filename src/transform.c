@@ -64,6 +64,7 @@
 #endif
 
 #include "transform.h"
+#include "names.h"
 #include "sqlbuf.h"
 
 #include <stdarg.h>
@@ -125,8 +126,9 @@ static void append_column(SqlBuf *b, const char *alias, const char *column)
 /*
  * One node the pattern refers to. A node is identified across the whole query
  * by its variable name; anonymous nodes are identified per occurrence. `label`
- * is its function table (from its single label); `alias` is the SQL alias used
- * for that table. A node is anchored to the first edge/side it appears on
+ * is its function table and `name` its edge-filter value (both from its single
+ * label, resolved through the name map); `alias` is the SQL alias used for that
+ * table. A node is anchored to the first edge/side it appears on
  * (anchor_edge == -1 means it never touches an edge -- a lone node with its own
  * table). `referenced` records that a column of the node is used, so its table
  * must be joined in.
@@ -135,6 +137,7 @@ typedef struct {
 	const char    *var;           /* NULL if anonymous */
 	const NodePat *np;            /* first occurrence, for anonymous identity */
 	const char    *label;         /* resolved table, or NULL */
+	const char    *name;          /* resolved *_name value, or NULL */
 	const char    *alias;         /* SQL alias for the table */
 	int            referenced;
 	int            is_lone;       /* never an edge endpoint -> own table */
@@ -144,11 +147,12 @@ typedef struct {
 
 /* One relationship: a row of __provenance__ tying a source slot to a target. */
 typedef struct {
-	const char *var;   /* NULL if anonymous */
-	const char *alias; /* SQL alias for the edge table */
-	const char *type;  /* edge_type literal, or NULL */
-	int         src;   /* source slot index */
-	int         tgt;   /* target slot index */
+	const char     *var;   /* NULL if anonymous */
+	const char     *alias; /* SQL alias for the edge table */
+	const char     *type;  /* edge_type literal, or NULL */
+	const PropList *props; /* inline property map, or NULL */
+	int             src;   /* source slot index */
+	int             tgt;   /* target slot index */
 } Edge;
 
 /*
@@ -699,8 +703,41 @@ static void emit_tie(SqlBuf *b, int *first, const Edge *edges, int ei,
 	append_column(b, ae->alias, anc_name);
 }
 
+/*
+ * Lower an inline relationship property map -- `-[{alias:'fast'}]->` -- to the
+ * same edge-column predicates the WHERE form (`e.alias = 'fast'`) produces:
+ * each `key: value` becomes `<edge>."key" = <value>`, ANDed onto the pattern
+ * predicates. The key must be a real column of the edge table and the value a
+ * literal. `pfirst` tracks whether any predicate has been emitted yet.
+ */
+static int emit_rel_props(SqlBuf *pred, int *pfirst, const char *edge_alias,
+                         const PropList *props, const Catalog *cat,
+                         char **errmsg)
+{
+	if (!props)
+		return 0;
+
+	const CatalogTable *et = catalog_find_table(cat, KG_EDGE_TABLE);
+	for (const PropList *p = props; p; p = p->next) {
+		if (!et || !catalog_table_has_column(et, p->key))
+			return fail(errmsg, "unknown column: %s.%s",
+				KG_EDGE_TABLE, p->key);
+		if (p->value->kind != EXPR_LITERAL)
+			return fail(errmsg, "inline relationship property '%s' "
+				"must be a literal value", p->key);
+		if (!*pfirst)
+			sqlbuf_append(pred, " AND ");
+		*pfirst = 0;
+		append_column(pred, edge_alias, p->key);
+		sqlbuf_append(pred, " = ");
+		emit_literal(pred, p->value);
+	}
+	return 0;
+}
+
 static int transform_general(const Match *m, const Return *r,
-                            const Catalog *cat, char **sql, char **errmsg)
+                            const Catalog *cat, const NameMap *map,
+                            char **sql, char **errmsg)
 {
 	/* Upper bounds: one slot per node occurrence, one edge per segment. */
 	int cap_nodes = 0, cap_edges = 0;
@@ -744,11 +781,6 @@ static int transform_general(const Match *m, const Return *r,
 			RelPat *rel = s->rel;
 			if (check_node(s->node, errmsg))
 				goto done;
-			if (rel->props) {
-				fail(errmsg,
-					"inline property maps are not supported yet");
-				goto done;
-			}
 			if (rel->types && rel->types->next) {
 				fail(errmsg,
 					"multiple relationship types are not supported yet");
@@ -770,6 +802,7 @@ static int transform_general(const Match *m, const Return *r,
 			int ei = nedges++;
 			edges[ei].var = rel->var;
 			edges[ei].type = rel->types ? rel->types->s : NULL;
+			edges[ei].props = rel->props;
 			edges[ei].src = src;
 			edges[ei].tgt = tgt;
 			if (slots[src].anchor_edge == -1) {
@@ -782,6 +815,16 @@ static int transform_general(const Match *m, const Return *r,
 			}
 			prev = cur;
 		}
+	}
+
+	/* Resolve each labelled slot through the name map: `label` becomes the
+	 * table to JOIN, `name` the *_name value its edge filter matches. */
+	for (int i = 0; i < nslots; i++) {
+		const char *table, *name;
+		if (names_resolve(map, slots[i].label, &table, &name, errmsg))
+			goto done;
+		slots[i].label = table;
+		slots[i].name = name;
 	}
 
 	/* Name each edge (variable, or a generated alias) . */
@@ -899,7 +942,7 @@ static int transform_general(const Match *m, const Return *r,
 			sqlbuf_append(&pred, " = ");
 			append_string(&pred, edges[i].type);
 		}
-		const char *sl = slots[edges[i].src].label;
+		const char *sl = slots[edges[i].src].name;
 		if (sl) {
 			if (!pfirst)
 				sqlbuf_append(&pred, " AND ");
@@ -908,7 +951,7 @@ static int transform_general(const Match *m, const Return *r,
 			sqlbuf_append(&pred, " = ");
 			append_string(&pred, sl);
 		}
-		const char *tl = slots[edges[i].tgt].label;
+		const char *tl = slots[edges[i].tgt].name;
 		if (tl) {
 			if (!pfirst)
 				sqlbuf_append(&pred, " AND ");
@@ -917,6 +960,9 @@ static int transform_general(const Match *m, const Return *r,
 			sqlbuf_append(&pred, " = ");
 			append_string(&pred, tl);
 		}
+		if (emit_rel_props(&pred, &pfirst, edges[i].alias,
+				edges[i].props, cat, errmsg))
+			goto done;
 	}
 
 	sqlbuf_append(&out, sel.data ? sel.data : "");
@@ -977,13 +1023,13 @@ static void orient_side(SqlBuf *o, int *first, const char *edge,
 		sqlbuf_append(o, " = ");
 		append_column(o, s->alias, "id");
 	}
-	if (s->label) {
+	if (s->name) {
 		if (!*first)
 			sqlbuf_append(o, " AND ");
 		*first = 0;
 		append_column(o, edge, namecol);
 		sqlbuf_append(o, " = ");
-		append_string(o, s->label);
+		append_string(o, s->name);
 	}
 }
 
@@ -999,22 +1045,24 @@ static void build_orient(SqlBuf *o, const char *edge, const char *su,
 static int transform_undirected(const NodePat *left, const RelPat *rel,
                                const NodePat *right, const Return *r,
                                const Expr *where, const Catalog *cat,
-                               char **sql, char **errmsg)
+                               const NameMap *map, char **sql, char **errmsg)
 {
 	if (check_node(left, errmsg) || check_node(right, errmsg))
 		return 1;
-	if (rel->props)
-		return fail(errmsg, "inline property maps are not supported yet");
 	if (rel->types && rel->types->next)
 		return fail(errmsg,
 			"multiple relationship types are not supported yet");
 
 	const char *u_label = left->labels ? left->labels->s : NULL;
 	const char *v_label = right->labels ? right->labels->s : NULL;
-	if (u_label && !catalog_find_table(cat, u_label))
-		return fail(errmsg, "unknown table: %s", u_label);
-	if (v_label && !catalog_find_table(cat, v_label))
-		return fail(errmsg, "unknown table: %s", v_label);
+	const char *u_table, *u_name, *v_table, *v_name;
+	if (names_resolve(map, u_label, &u_table, &u_name, errmsg)
+			|| names_resolve(map, v_label, &v_table, &v_name, errmsg))
+		return 1;
+	if (u_table && !catalog_find_table(cat, u_table))
+		return fail(errmsg, "unknown table: %s", u_table);
+	if (v_table && !catalog_find_table(cat, v_table))
+		return fail(errmsg, "unknown table: %s", v_table);
 
 	const char *edge = rel->var ? rel->var : "r";
 	const char *type = rel->types ? rel->types->s : NULL;
@@ -1023,20 +1071,22 @@ static int transform_undirected(const NodePat *left, const RelPat *rel,
 	Slot slots[2];
 	memset(slots, 0, sizeof slots);
 	slots[0].var = left->var;
-	slots[0].label = u_label;
+	slots[0].label = u_table;
+	slots[0].name = u_name;
 	slots[0].alias = left->var;
 	slots[0].anchor_edge = -1;
 	slots[1].var = right->var;
-	slots[1].label = v_label;
+	slots[1].label = v_table;
+	slots[1].name = v_name;
 	slots[1].alias = right->var;
 	slots[1].anchor_edge = -1;
 
 	Bind binds[3];
 	int nb = 0;
 	if (left->var)
-		binds[nb++] = (Bind){ left->var, u_label, 1, 0 };
+		binds[nb++] = (Bind){ left->var, u_table, 1, 0 };
 	if (right->var)
-		binds[nb++] = (Bind){ right->var, v_label, 1, 1 };
+		binds[nb++] = (Bind){ right->var, v_table, 1, 1 };
 	if (rel->var)
 		binds[nb++] = (Bind){ rel->var, KG_EDGE_TABLE, 0, -1 };
 
@@ -1105,6 +1155,8 @@ static int transform_undirected(const NodePat *left, const RelPat *rel,
 		sqlbuf_append(&pred, o2.data);
 		sqlbuf_append(&pred, ")");
 	}
+	if (emit_rel_props(&pred, &first, edge, rel->props, cat, errmsg))
+		goto done;
 
 	int have_pred = pred.len > 0;
 	int have_user = uw.len > 0;
@@ -1164,12 +1216,13 @@ done:
 static int transform_varlen(const NodePat *left, const RelPat *rel,
                            const NodePat *right, const Return *r,
                            const Expr *where, const Catalog *cat,
-                           char **sql, char **errmsg)
+                           const NameMap *map, char **sql, char **errmsg)
 {
 	if (check_node(left, errmsg) || check_node(right, errmsg))
 		return 1;
 	if (rel->props)
-		return fail(errmsg, "inline property maps are not supported yet");
+		return fail(errmsg, "inline property maps are not supported on "
+			"variable-length relationships");
 	if (rel->types && rel->types->next)
 		return fail(errmsg,
 			"multiple relationship types are not supported yet");
@@ -1195,10 +1248,14 @@ static int transform_varlen(const NodePat *left, const RelPat *rel,
 
 	const char *u_label = left->labels ? left->labels->s : NULL;
 	const char *v_label = right->labels ? right->labels->s : NULL;
-	if (u_label && !catalog_find_table(cat, u_label))
-		return fail(errmsg, "unknown table: %s", u_label);
-	if (v_label && !catalog_find_table(cat, v_label))
-		return fail(errmsg, "unknown table: %s", v_label);
+	const char *u_table, *u_name, *v_table, *v_name;
+	if (names_resolve(map, u_label, &u_table, &u_name, errmsg)
+			|| names_resolve(map, v_label, &v_table, &v_name, errmsg))
+		return 1;
+	if (u_table && !catalog_find_table(cat, u_table))
+		return fail(errmsg, "unknown table: %s", u_table);
+	if (v_table && !catalog_find_table(cat, v_table))
+		return fail(errmsg, "unknown table: %s", v_table);
 
 	const char *type = rel->types ? rel->types->s : NULL;
 	const char *edge = "r"; /* the walk CTE's alias in the outer query */
@@ -1207,20 +1264,22 @@ static int transform_varlen(const NodePat *left, const RelPat *rel,
 	Slot slots[2];
 	memset(slots, 0, sizeof slots);
 	slots[0].var = left->var;
-	slots[0].label = u_label;
+	slots[0].label = u_table;
+	slots[0].name = u_name;
 	slots[0].alias = left->var;
 	slots[0].anchor_edge = -1;
 	slots[1].var = right->var;
-	slots[1].label = v_label;
+	slots[1].label = v_table;
+	slots[1].name = v_name;
 	slots[1].alias = right->var;
 	slots[1].anchor_edge = -1;
 
 	Bind binds[2];
 	int nb = 0;
 	if (left->var)
-		binds[nb++] = (Bind){ left->var, u_label, 1, 0 };
+		binds[nb++] = (Bind){ left->var, u_table, 1, 0 };
 	if (right->var)
-		binds[nb++] = (Bind){ right->var, v_label, 1, 1 };
+		binds[nb++] = (Bind){ right->var, v_table, 1, 1 };
 
 	SqlBuf sel, uw, pred, grp, ord, out;
 	sqlbuf_init(&sel);
@@ -1344,14 +1403,14 @@ static int transform_varlen(const NodePat *left, const RelPat *rel,
 	int pfirst = 1;
 	for (int k = 0; k < 2; k++) {
 		Slot *s = &slots[ends[k].slot];
-		if (!s->label)
+		if (!s->name)
 			continue;
 		if (!pfirst)
 			sqlbuf_append(&pred, " AND ");
 		pfirst = 0;
 		append_column(&pred, edge, ends[k].namecol);
 		sqlbuf_append(&pred, " = ");
-		append_string(&pred, s->label);
+		append_string(&pred, s->name);
 	}
 	if (min > 1) {
 		char buf[32];
@@ -1395,7 +1454,7 @@ done:
 
 /* ------------------------------------------------------------- entry point --- */
 
-int transform_query(const Query *q, const Catalog *cat,
+int transform_query(const Query *q, const Catalog *cat, const NameMap *map,
                     char **sql, char **errmsg)
 {
 	*sql = NULL;
@@ -1429,7 +1488,7 @@ int transform_query(const Query *q, const Catalog *cat,
 				"only supported as a single hop");
 		const Path *p = m->patterns->path;
 		return transform_varlen(p->start, p->segments->rel,
-			p->segments->node, q->ret, m->where, cat, sql, errmsg);
+			p->segments->node, q->ret, m->where, cat, map, sql, errmsg);
 	}
 
 	if (has_undirected) {
@@ -1438,8 +1497,8 @@ int transform_query(const Query *q, const Catalog *cat,
 				"supported as a single hop");
 		const Path *p = m->patterns->path;
 		return transform_undirected(p->start, p->segments->rel,
-			p->segments->node, q->ret, m->where, cat, sql, errmsg);
+			p->segments->node, q->ret, m->where, cat, map, sql, errmsg);
 	}
 
-	return transform_general(m, q->ret, cat, sql, errmsg);
+	return transform_general(m, q->ret, cat, map, sql, errmsg);
 }

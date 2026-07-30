@@ -12,14 +12,17 @@
 
 #include "ast.h"
 #include "catalog.h"
+#include "names.h"
 
 /*
  * Translate Query q into SQL, resolving labels and validating properties
- * against cat. On success returns 0 and stores a malloc'd SQL string in *sql
+ * against cat. Node labels are resolved through map (which may be NULL, giving
+ * the identity resolution), so a label may be written as either a table name or
+ * a command name. On success returns 0 and stores a malloc'd SQL string in *sql
  * (caller frees). On failure returns non-zero and, if errmsg is non-NULL,
  * stores a malloc'd message there (caller frees).
  */
-int transform_query(const Query *q, const Catalog *cat,
+int transform_query(const Query *q, const Catalog *cat, const NameMap *map,
                     char **sql, char **errmsg);
 
 #endif /* KNIT_GRAPH_TRANSFORM_H */

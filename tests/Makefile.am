@@ -16,6 +16,7 @@ TESTS = \
 	catalog.sh \
 	explain.sh \
 	exec.sh \
+	names.sh \
 	output.sh \
 	memcheck.sh
 
@@ -28,6 +29,7 @@ EXTRA_DIST = \
 	catalog.sh \
 	explain.sh \
 	exec.sh \
+	names.sh \
 	output.sh \
 	memcheck.sh \
 	fixture.sh \

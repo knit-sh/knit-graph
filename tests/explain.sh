@@ -36,6 +36,24 @@ reject() {
 	fi
 }
 
+# expectm MAP QUERY EXPECTED-SQL: like expect, but the query is translated with
+# the name map MAP (--names). rejectm MAP QUERY: like reject, with a map.
+expectm() {
+	got=$("$KG" --explain --names "$1" "$db" "$2" 2>&1)
+	if [ "$got" != "$3" ]; then
+		echo "FAIL: $2"
+		echo "  expected: $3"
+		echo "  got:      $got"
+		fail=1
+	fi
+}
+rejectm() {
+	if "$KG" --explain --names "$1" "$db" "$2" >/dev/null 2>&1; then
+		echo "FAIL: should have been rejected: $2"
+		fail=1
+	fi
+}
+
 # expecth QUERY <<'EOF' ... EOF : like expect, but the expected SQL is read from
 # a quoted heredoc, sparing the variable-length CTE's many single quotes from the
 # '"'"' escaping dance. Command substitution trims the heredoc's trailing
@@ -207,6 +225,39 @@ reject 'MATCH (a:`ns:f`) WHERE count(a.x) > 1 RETURN a.x'      # aggregate not v
 reject 'MATCH (a:`ns:f`) RETURN a.nope'      # unknown column
 reject 'MATCH (a:`nope:x`) RETURN a.id'      # unknown table
 reject 'MATCH (a) RETURN a.x'                # node has no label
+
+# Name map: a label may be written as either a table name or the command name
+# its edges record. The map here gives table "ns:f" the recorded name "fnode".
+# The command-name spelling joins the table but filters on the recorded name...
+expectm 'ns:f=fnode' 'MATCH (a:fnode)-[:calls]->(b:`ns2:g`) RETURN b.id' \
+	'SELECT b."id" FROM "__provenance__" r JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'fnode'"'"' AND r."target_name" = '"'"'ns2:g'"'"''
+# ...and the table-name spelling resolves to the very same SQL.
+expectm 'ns:f=fnode' 'MATCH (a:`ns:f`)-[:calls]->(b:`ns2:g`) RETURN b.id' \
+	'SELECT b."id" FROM "__provenance__" r JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'fnode'"'"' AND r."target_name" = '"'"'ns2:g'"'"''
+# A label absent from the map resolves to itself (no map at all is the same).
+expectm 'ns:f=fnode' 'MATCH (a:`ns2:g`) RETURN a.z' \
+	'SELECT a."z" FROM "ns2:g" a'
+# A label that is a table name in one entry and a command name in another is
+# genuinely ambiguous and must be rejected, not guessed.
+rejectm 'ns:f=fnode
+x=ns:f' 'MATCH (a:`ns:f`) RETURN a.x'
+
+# Inline relationship property maps lower to the same edge predicate the WHERE
+# form (e.alias = 'fast') produces -- ANDed onto the pattern predicates.
+expect 'MATCH (a:`ns:f`)-[{alias:"fast"}]->(b:`ns2:g`) RETURN b.id' \
+	'SELECT b."id" FROM "__provenance__" r JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' AND r."alias" = '"'"'fast'"'"''
+# Alongside an edge type.
+expect 'MATCH (a:`ns:f`)-[:calls {alias:"fast"}]->(b:`ns2:g`) RETURN b.id' \
+	'SELECT b."id" FROM "__provenance__" r JOIN "ns2:g" b ON b."id" = r."target_id" WHERE r."edge_type" = '"'"'calls'"'"' AND r."source_name" = '"'"'ns:f'"'"' AND r."target_name" = '"'"'ns2:g'"'"' AND r."alias" = '"'"'fast'"'"''
+# Undirected hop: the alias predicate applies to the edge row regardless of the
+# orientation, so it is ANDed after the OR over both orientations.
+expect 'MATCH (a:`ns:f`)-[{alias:"fast"}]-(b:`ns2:g`) RETURN b.id' \
+	'SELECT b."id" FROM "__provenance__" r JOIN "ns2:g" b ON 1 = 1 WHERE (r."source_name" = '"'"'ns:f'"'"' AND r."target_id" = b."id" AND r."target_name" = '"'"'ns2:g'"'"' OR r."target_name" = '"'"'ns:f'"'"' AND r."source_id" = b."id" AND r."source_name" = '"'"'ns2:g'"'"') AND r."alias" = '"'"'fast'"'"''
+
+# Inline property errors.
+reject 'MATCH (a:`ns:f`)-[{nope:"x"}]->(b:`ns2:g`) RETURN b.id'       # unknown edge column
+reject 'MATCH (a:`ns:f`)-[{alias:a.x}]->(b:`ns2:g`) RETURN b.id'      # non-literal value
+reject 'MATCH (a:`ns:f`)-[:chain*1..2 {alias:"x"}]->(b:`ns:f`) RETURN b.id'  # inline on var-length
 
 rm -f "$db"
 exit $fail

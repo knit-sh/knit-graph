@@ -6,6 +6,7 @@ knit_graph_SOURCES = \
 	main.c \
 	ast.c ast.h \
 	catalog.c catalog.h \
+	names.c names.h \
 	sqlbuf.c sqlbuf.h \
 	transform.c transform.h \
 	exec.c exec.h \

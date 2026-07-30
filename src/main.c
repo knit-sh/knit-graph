@@ -26,6 +26,7 @@
 #include "ast.h"
 #include "catalog.h"
 #include "exec.h"
+#include "names.h"
 #include "transform.h"
 
 static const char *PROG = "knit-graph";
@@ -47,6 +48,12 @@ static void usage(FILE *out)
 		"  --catalog     list the database's tables and columns; with a TABLE or\n"
 		"                TABLE.COLUMN argument, validate that reference\n"
 		"  -h, --help    show this help and exit\n"
+		"\n"
+		"Label resolution (default run and --explain):\n"
+		"  --names SPEC          map entries 'table=name', separated by newlines\n"
+		"                        or ';', so a label may be a table or command name\n"
+		"  --names-file FILE     read the same map from FILE\n"
+		"  --derive-table-names  with no map, derive it from the data\n"
 		"\n"
 		"Output options (mirroring the sqlite3 CLI; default is -list):\n"
 		"  -ascii -box -column -csv -html -json -line -list -markdown -table -tabs\n"
@@ -203,10 +210,65 @@ static int run_catalog(const char *dbfile, const char *ref)
 }
 
 /*
+ * Build the explicit name map from the --names / --names-file options (at most
+ * one may be given). Returns 0 with *out set (possibly NULL when neither option
+ * was used), or a nonzero process exit code after reporting the error.
+ */
+static int build_explicit_map(const char *spec, const char *file, NameMap **out)
+{
+	*out = NULL;
+	char *err = NULL;
+	if (spec && file) {
+		fprintf(stderr,
+			"%s: specify at most one of --names / --names-file\n", PROG);
+		return 2;
+	}
+	if (spec) {
+		if (names_parse(spec, out, &err) != 0) {
+			fprintf(stderr, "%s: %s\n", PROG,
+				err ? err : "invalid name map");
+			free(err);
+			return 1;
+		}
+	} else if (file) {
+		if (names_parse_file(file, out, &err) != 0) {
+			fprintf(stderr, "%s: %s\n", PROG,
+				err ? err : "invalid name map file");
+			free(err);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Choose the name map the transformer resolves labels through. An explicit map
+ * (from --names/--names-file) always wins; otherwise, when --derive-table-names
+ * was given, one is derived from the data (needing db and cat). Returns 0 and
+ * sets *eff to the borrowed effective map (which may be NULL) and *owned to a
+ * derived map the caller must names_free (or NULL). On failure returns 1 with a
+ * malloc'd *err.
+ */
+static int effective_map(sqlite3 *db, const Catalog *cat,
+                        const NameMap *explicit_map, int derive,
+                        const NameMap **eff, NameMap **owned, char **err)
+{
+	*owned = NULL;
+	*eff = explicit_map;
+	if (!explicit_map && derive) {
+		if (names_derive(db, cat, owned, err) != 0)
+			return 1;
+		*eff = *owned;
+	}
+	return 0;
+}
+
+/*
  * --explain: parse QUERY, translate it to SQL using DBFILE's schema, and print
  * the SQL without executing it. Returns a process exit code.
  */
-static int run_explain(const char *dbfile, const char *query)
+static int run_explain(const char *dbfile, const char *query,
+                      const NameMap *map, int derive)
 {
 	sqlite3 *db = open_db_ro(dbfile);
 	if (!db)
@@ -221,8 +283,20 @@ static int run_explain(const char *dbfile, const char *query)
 		return 1;
 	}
 
+	const NameMap *eff = NULL;
+	NameMap *owned = NULL;
+	if (effective_map(db, cat, map, derive, &eff, &owned, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG,
+			err ? err : "cannot derive table names");
+		free(err);
+		catalog_free(cat);
+		sqlite3_close(db);
+		return 1;
+	}
+
 	Query *q = parse_or_report(query);
 	if (!q) {
+		names_free(owned);
 		catalog_free(cat);
 		sqlite3_close(db);
 		return 1;
@@ -230,7 +304,7 @@ static int run_explain(const char *dbfile, const char *query)
 
 	char *sql = NULL;
 	int status = 0;
-	if (transform_query(q, cat, &sql, &err) != 0) {
+	if (transform_query(q, cat, eff, &sql, &err) != 0) {
 		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot translate query");
 		status = 1;
 	} else {
@@ -240,6 +314,7 @@ static int run_explain(const char *dbfile, const char *query)
 	free(sql);
 	free(err);
 	ast_free_query(q);
+	names_free(owned);
 	catalog_free(cat);
 	sqlite3_close(db);
 	return status;
@@ -250,7 +325,7 @@ static int run_explain(const char *dbfile, const char *query)
  * execute it, and print the result set in "-list" format. Returns an exit code.
  */
 static int run_query(const char *dbfile, const char *query,
-		     const OutputOptions *opts)
+		     const OutputOptions *opts, const NameMap *map, int derive)
 {
 	sqlite3 *db = open_db_ro(dbfile);
 	if (!db)
@@ -265,8 +340,20 @@ static int run_query(const char *dbfile, const char *query,
 		return 1;
 	}
 
+	const NameMap *eff = NULL;
+	NameMap *owned = NULL;
+	if (effective_map(db, cat, map, derive, &eff, &owned, &err) != 0) {
+		fprintf(stderr, "%s: %s\n", PROG,
+			err ? err : "cannot derive table names");
+		free(err);
+		catalog_free(cat);
+		sqlite3_close(db);
+		return 1;
+	}
+
 	Query *q = parse_or_report(query);
 	if (!q) {
+		names_free(owned);
 		catalog_free(cat);
 		sqlite3_close(db);
 		return 1;
@@ -274,7 +361,7 @@ static int run_query(const char *dbfile, const char *query,
 
 	char *sql = NULL;
 	int status = 0;
-	if (transform_query(q, cat, &sql, &err) != 0) {
+	if (transform_query(q, cat, eff, &sql, &err) != 0) {
 		fprintf(stderr, "%s: %s\n", PROG, err ? err : "cannot translate query");
 		status = 1;
 	} else if (exec_query(db, sql, opts, &err) != 0) {
@@ -285,6 +372,7 @@ static int run_query(const char *dbfile, const char *query,
 	free(sql);
 	free(err);
 	ast_free_query(q);
+	names_free(owned);
 	catalog_free(cat);
 	sqlite3_close(db);
 	return status;
@@ -295,6 +383,9 @@ int main(int argc, char **argv)
 	int ast_mode = 0;
 	int explain_mode = 0;
 	int catalog_mode = 0;
+	int derive = 0;
+	const char *names_spec = NULL;
+	const char *names_file = NULL;
 	OutputOptions opts = { OUT_LIST, 1, "|", "\n" };
 	const char *pos[2] = { NULL, NULL };
 	int npos = 0;
@@ -311,6 +402,20 @@ int main(int argc, char **argv)
 			explain_mode = 1;
 		} else if (strcmp(argv[i], "--catalog") == 0) {
 			catalog_mode = 1;
+		} else if (strcmp(argv[i], "--derive-table-names") == 0) {
+			derive = 1;
+		} else if (strcmp(argv[i], "--names") == 0
+				|| strcmp(argv[i], "--names-file") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "%s: %s expects an argument\n",
+					PROG, argv[i]);
+				usage(stderr);
+				return 2;
+			}
+			if (argv[i][7] == '\0') /* --names */
+				names_spec = argv[++i];
+			else                    /* --names-file */
+				names_file = argv[++i];
 		} else if (output_flag(&opts, argv, argc, &i, &want_value)) {
 			if (want_value) {
 				fprintf(stderr, "%s: %s expects an argument\n",
@@ -344,7 +449,13 @@ int main(int argc, char **argv)
 			usage(stderr);
 			return 2;
 		}
-		return run_explain(pos[0], pos[1]);
+		NameMap *map = NULL;
+		int mrc = build_explicit_map(names_spec, names_file, &map);
+		if (mrc)
+			return mrc;
+		int rc = run_explain(pos[0], pos[1], map, derive);
+		names_free(map);
+		return rc;
 	}
 
 	/* --catalog: introspect DBFILE, optionally validating a reference. */
@@ -378,5 +489,11 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	return run_query(pos[0], pos[1], &opts);
+	NameMap *map = NULL;
+	int mrc = build_explicit_map(names_spec, names_file, &map);
+	if (mrc)
+		return mrc;
+	int rc = run_query(pos[0], pos[1], &opts, map, derive);
+	names_free(map);
+	return rc;
 }
